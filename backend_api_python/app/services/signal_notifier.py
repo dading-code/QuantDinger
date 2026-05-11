@@ -221,6 +221,8 @@ class SignalNotifier:
                         message=message_plain,
                         payload=payload,
                     )
+                    # Also broadcast via WebSocket to local clients
+                    self._broadcast_via_websocket(strategy_id=strategy_id, payload=payload)
                 elif c == "webhook":
                     url = (targets.get("webhook") or "").strip()
                     ok, err = self._notify_webhook(
@@ -536,6 +538,68 @@ class SignalNotifier:
             logger.warning(f"browser notify persist failed: {e}")
             logger.exception("browser.error")
             return False, str(e)
+
+    def _broadcast_via_websocket(
+        self,
+        *,
+        strategy_id: Optional[int] = None,
+        payload: Dict[str, Any],
+    ) -> None:
+        """
+        Broadcast signal to local clients via WebSocket.
+        
+        This method broadcasts the signal to all connected WebSocket clients
+        that belong to the same user as the strategy owner.
+        """
+        try:
+            # Get user_id from strategy
+            user_id = None
+            if strategy_id is not None:
+                try:
+                    with get_db_connection() as db:
+                        cur = db.cursor()
+                        cur.execute("SELECT user_id FROM qd_strategies_trading WHERE id = %s", (int(strategy_id),))
+                        row = cur.fetchone()
+                        cur.close()
+                    user_id = int((row or {}).get('user_id')) if row else None
+                except Exception as e:
+                    logger.warning(f"Failed to get user_id for strategy {strategy_id}: {e}")
+                    return
+            
+            if not user_id:
+                logger.warning(f"Cannot broadcast WebSocket signal: no user_id found for strategy {strategy_id}")
+                return
+            
+            # Try to broadcast via WebSocket hub
+            try:
+                from app.services.websocket_signal import get_signal_hub
+                
+                hub = get_signal_hub()
+                if hub:
+                    # Run async broadcast in a non-blocking way
+                    import asyncio
+                    
+                    # Create a new event loop for this thread
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(
+                            hub.broadcast_signal(
+                                signal_data=payload,
+                                target_user_id=user_id
+                            )
+                        )
+                        loop.close()
+                        logger.info(f"WebSocket signal broadcasted to user {user_id} (strategy {strategy_id})")
+                    except Exception as ws_err:
+                        logger.warning(f"WebSocket broadcast failed: {ws_err}")
+                else:
+                    logger.debug("WebSocket hub not available, skipping broadcast")
+            except ImportError:
+                logger.debug("websocket_signal module not available, skipping broadcast")
+        except Exception as e:
+            # Don't fail the notification if WebSocket broadcast fails
+            logger.warning(f"WebSocket broadcast error (non-critical): {e}")
 
     def _notify_webhook(
         self,

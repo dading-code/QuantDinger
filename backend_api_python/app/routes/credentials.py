@@ -307,3 +307,113 @@ def get_credential():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
+# ============================================================================
+# Local Broker Helper APIs (for MT5, IBKR that require local client)
+# ============================================================================
+
+LOCAL_BROKERS = ['mt5', 'ibkr']
+
+
+@credentials_bp.route('/is-local-broker', methods=['GET'])
+@login_required
+def is_local_broker():
+    """
+    Check if an exchange requires local execution (MT5, IBKR).
+    
+    Query params:
+        exchange_id: Exchange identifier (e.g., 'mt5', 'ibkr', 'binance')
+    
+    Returns:
+        {
+            "code": 1,
+            "data": {
+                "is_local": true,
+                "exchange_id": "mt5",
+                "requires_client": true,
+                "client_download_url": "/download/local-client"
+            }
+        }
+    """
+    try:
+        exchange_id = request.args.get('exchange_id', '').lower().strip()
+        
+        if not exchange_id:
+            return jsonify({'code': 0, 'msg': 'Missing exchange_id parameter', 'data': None}), 400
+        
+        is_local = exchange_id in LOCAL_BROKERS
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'exchange_id': exchange_id,
+                'is_local': is_local,
+                'requires_client': is_local,
+                'client_download_url': '/download/local-client' if is_local else None,
+                'client_name': 'QuantDinger Local Client' if is_local else None,
+                'description': '需要下载本地客户端以接收交易信号并执行' if is_local else None
+            }
+        })
+    except Exception as e:
+        logger.error(f"is_local_broker failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@credentials_bp.route('/local-brokers/list', methods=['GET'])
+@login_required
+def list_local_brokers():
+    """
+    Get list of all exchanges that require local execution.
+    
+    Returns:
+        {
+            "code": 1,
+            "data": {
+                "brokers": [
+                    {
+                        "exchange_id": "mt5",
+                        "name": "MetaTrader 5",
+                        "requires_client": true,
+                        "description": "外汇/差价合约交易平台"
+                    },
+                    {
+                        "exchange_id": "ibkr",
+                        "name": "Interactive Brokers",
+                        "requires_client": true,
+                        "description": "美股/全球股票交易平台"
+                    }
+                ]
+            }
+        }
+    """
+    try:
+        brokers = [
+            {
+                'exchange_id': 'mt5',
+                'name': 'MetaTrader 5',
+                'requires_client': True,
+                'description': '外汇/差价合约交易平台',
+                'icon': 'mt5'
+            },
+            {
+                'exchange_id': 'ibkr',
+                'name': 'Interactive Brokers',
+                'requires_client': True,
+                'description': '美股/全球股票交易平台',
+                'icon': 'ibkr'
+            }
+        ]
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'brokers': brokers,
+                'total': len(brokers)
+            }
+        })
+    except Exception as e:
+        logger.error(f"list_local_brokers failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+

@@ -14,6 +14,10 @@ from typing import Optional
 from src.core.config import ConfigManager
 from src.core.signal_client import SignalClient
 from src.core.api_client import CloudAPIClient
+from src.core.risk_manager import RiskManager
+from src.core.signal_processor import SignalProcessor
+from src.brokers.simulation import SimulationBroker
+from src.brokers import MT5Broker, IBKRBroker, MT5_AVAILABLE, IBKR_AVAILABLE
 
 
 class QuantDingerApp:
@@ -35,6 +39,11 @@ class QuantDingerApp:
         self.signal_client: Optional[SignalClient] = None
         self.client_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
+        
+        # Trading components
+        self.broker = None
+        self.risk_manager = None
+        self.signal_processor = None
         
         # Statistics
         self.signal_count = 0
@@ -78,7 +87,7 @@ class QuantDingerApp:
         
         # Cloud API URL
         ttk.Label(frame, text="云端地址:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.cloud_url_var = tk.StringVar(value="http://localhost:5000/api")
+        self.cloud_url_var = tk.StringVar(value="http://39.105.150.99:8888/api")
         entry = ttk.Entry(frame, textvariable=self.cloud_url_var, width=50)
         entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
         
@@ -110,7 +119,7 @@ class QuantDingerApp:
         
         # WebSocket URL
         ttk.Label(frame, text="WS 地址:").grid(row=6, column=0, sticky=tk.W, pady=5)
-        self.ws_url_var = tk.StringVar(value="ws://localhost:8765/ws")
+        self.ws_url_var = tk.StringVar(value="ws://39.105.150.99:8888/ws")
         entry = ttk.Entry(frame, textvariable=self.ws_url_var, width=50)
         entry.grid(row=6, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
         
@@ -193,8 +202,8 @@ class QuantDingerApp:
         self.username_var.set(self.config_mgr.get('username', ''))
         self.password_var.set(self.config_mgr.get('password', ''))
         self.api_key_var.set(self.config_mgr.get('api_key', ''))
-        self.cloud_url_var.set(self.config_mgr.get('cloud_api_url', 'http://localhost:5000/api'))
-        self.ws_url_var.set(self.config_mgr.get('cloud_url', 'ws://localhost:8765/ws'))
+        self.cloud_url_var.set(self.config_mgr.get('cloud_api_url', 'http://39.105.150.99:8888/api'))
+        self.ws_url_var.set(self.config_mgr.get('cloud_url', 'ws://39.105.150.99:8888/ws'))
         self.broker_var.set(self.config_mgr.get('broker', 'simulation'))
     
     def _save_config(self):
@@ -352,6 +361,7 @@ class QuantDingerApp:
         """Start the signal client."""
         api_key = self.api_key_var.get().strip()
         ws_url = self.ws_url_var.get().strip()
+        broker_type = self.broker_var.get().strip()
         
         if not api_key:
             messagebox.showerror("错误", "请先登录并获取 API 密钥")
@@ -361,13 +371,13 @@ class QuantDingerApp:
             messagebox.showerror("错误", "请输入 WebSocket 地址")
             return
         
-        self._log(f"启动客户端: 券商={self.broker_var.get()}")
+        self._log(f"启动客户端: 券商={broker_type}")
         self.stop_event.clear()
         
         # Start in background thread
         self.client_thread = threading.Thread(
             target=self._run_client,
-            args=(api_key, ws_url),
+            args=(api_key, ws_url, broker_type),
             daemon=True
         )
         self.client_thread.start()
@@ -383,11 +393,67 @@ class QuantDingerApp:
         self._update_status(False)
         self._log("客户端已停止")
     
-    def _run_client(self, api_key: str, cloud_url: str):
+    def _run_client(self, api_key: str, cloud_url: str, broker_type: str):
         """Run signal client in background thread."""
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            
+            # Initialize broker
+            self._log(f"初始化券商: {broker_type}")
+            
+            if broker_type == 'simulation':
+                self.broker = SimulationBroker(config={'initial_balance': 10000.0})
+                loop.run_until_complete(self.broker.connect())
+                self._log("✓ 模拟券商已连接")
+            
+            elif broker_type == 'mt5':
+                if not MT5_AVAILABLE:
+                    self._log("❌ MT5库未安装，请使用: pip install MetaTrader5")
+                    self._log("⚠️ 切换到模拟模式")
+                    self.broker = SimulationBroker(config={'initial_balance': 10000.0})
+                    loop.run_until_complete(self.broker.connect())
+                else:
+                    mt5_config = self.config_mgr.get('mt5', {})
+                    self.broker = MT5Broker(config=mt5_config)
+                    connected = loop.run_until_complete(self.broker.connect())
+                    if connected:
+                        self._log("✓ MT5券商已连接")
+                    else:
+                        self._log("❌ MT5连接失败，切换到模拟模式")
+                        self.broker = SimulationBroker(config={'initial_balance': 10000.0})
+                        loop.run_until_complete(self.broker.connect())
+            
+            elif broker_type == 'ibkr':
+                if not IBKR_AVAILABLE:
+                    self._log("❌ ib_insync库未安装，请使用: pip install ib_insync")
+                    self._log("⚠️ 切换到模拟模式")
+                    self.broker = SimulationBroker(config={'initial_balance': 10000.0})
+                    loop.run_until_complete(self.broker.connect())
+                else:
+                    ibkr_config = self.config_mgr.get('ibkr', {})
+                    self.broker = IBKRBroker(config=ibkr_config)
+                    connected = loop.run_until_complete(self.broker.connect())
+                    if connected:
+                        self._log("✓ IBKR券商已连接")
+                    else:
+                        self._log("❌ IBKR连接失败，切换到模拟模式")
+                        self.broker = SimulationBroker(config={'initial_balance': 10000.0})
+                        loop.run_until_complete(self.broker.connect())
+            
+            else:
+                self._log(f"⚠️ 未知券商类型 '{broker_type}'，使用模拟模式")
+                self.broker = SimulationBroker(config={'initial_balance': 10000.0})
+                loop.run_until_complete(self.broker.connect())
+            
+            # Initialize risk manager
+            risk_config = self.config_mgr.get('risk_management', {})
+            self.risk_manager = RiskManager(risk_config)
+            self._log("✓ 风险管理引擎已启动")
+            
+            # Initialize signal processor
+            self.signal_processor = SignalProcessor(self.broker, self.risk_manager)
+            self._log("✓ 信号处理器已就绪")
             
             # Create signal client with callbacks
             client = SignalClient(
@@ -421,6 +487,28 @@ class QuantDingerApp:
             f"{signal.get('symbol')} - "
             f"{signal.get('signal_type')}"
         )
+        
+        # Execute trade if signal processor is available
+        if self.signal_processor:
+            try:
+                # Process signal and execute trade
+                import asyncio
+                loop = asyncio.new_event_loop()
+                result = loop.run_until_complete(
+                    self.signal_processor.process_signal(signal_data)
+                )
+                loop.close()
+                
+                if result['status'] == 'executed':
+                    self.trade_count += 1
+                    self.root.after(0, lambda: self.trade_label.config(text=f"Trades: {self.trade_count}"))
+                    self._log(f"✓ 交易执行成功: {result.get('trade_result', {}).get('order_id')}")
+                elif result['status'] == 'rejected':
+                    self._log(f"⚠️ 交易被拒绝: {result.get('reason')}")
+                else:
+                    self._log(f"❌ 交易错误: {result.get('reason')}")
+            except Exception as e:
+                self._log(f"❌ 交易执行失败: {str(e)}")
     
     def run(self):
         """Run the application."""

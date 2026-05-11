@@ -11,7 +11,7 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-websocket_bp = Blueprint("websocket", __name__)
+websocket_bp = Blueprint("agent_websocket", __name__)
 
 
 @websocket_bp.route("/stats", methods=["GET"])
