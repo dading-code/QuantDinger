@@ -92,7 +92,7 @@ class CloudAPIClient:
             return None
         
         try:
-            url = f"{self.base_url}/user/api-key/create"
+            url = f"{self.base_url}/users/api-key/create"
             response = self.session.post(url, json={
                 'key_name': key_name,
                 'description': description,
@@ -124,7 +124,7 @@ class CloudAPIClient:
             return None
         
         try:
-            url = f"{self.base_url}/user/api-key/list"
+            url = f"{self.base_url}/users/api-key/list"
             response = self.session.get(url)
             
             if response.status_code == 200:
@@ -154,7 +154,7 @@ class CloudAPIClient:
             return False
         
         try:
-            url = f"{self.base_url}/user/api-key/revoke"
+            url = f"{self.base_url}/users/api-key/revoke"
             response = self.session.post(url, json={'key_id': key_id})
             
             if response.status_code == 200:
@@ -185,7 +185,7 @@ class CloudAPIClient:
             return False
         
         try:
-            url = f"{self.base_url}/user/api-key/delete"
+            url = f"{self.base_url}/users/api-key/delete"
             response = self.session.delete(url, json={'key_id': key_id})
             
             if response.status_code == 200:

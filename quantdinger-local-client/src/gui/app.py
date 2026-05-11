@@ -13,7 +13,6 @@ from typing import Optional
 
 from src.core.config import ConfigManager
 from src.core.signal_client import SignalClient
-from src.core.api_client import CloudAPIClient
 from src.core.risk_manager import RiskManager
 from src.core.signal_processor import SignalProcessor
 from src.brokers.simulation import SimulationBroker
@@ -26,14 +25,11 @@ class QuantDingerApp:
     def __init__(self):
         """Initialize the application."""
         self.root = tk.Tk()
-        self.root.title("QuantDinger 本地交易客户端 v1.0")
+        self.root.title("QuantDinger 本地交易客户端 v2.0 - API Key模式")
         self.root.geometry("1200x800")
         
         # Configuration
         self.config_mgr = ConfigManager("config.json")
-        
-        # Cloud API client for authentication
-        self.cloud_api: Optional[CloudAPIClient] = None
         
         # Signal client
         self.signal_client: Optional[SignalClient] = None
@@ -91,49 +87,38 @@ class QuantDingerApp:
         entry = ttk.Entry(frame, textvariable=self.cloud_url_var, width=50)
         entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
         
-        # Username
-        ttk.Label(frame, text="用户名:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.username_var = tk.StringVar()
-        entry = ttk.Entry(frame, textvariable=self.username_var, width=50)
+        # WebSocket URL
+        ttk.Label(frame, text="WS 地址:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.ws_url_var = tk.StringVar(value="ws://39.105.150.99:8888/ws")
+        entry = ttk.Entry(frame, textvariable=self.ws_url_var, width=50)
         entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
         
-        # Password
-        ttk.Label(frame, text="密码:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.password_var = tk.StringVar()
-        entry = ttk.Entry(frame, textvariable=self.password_var, width=50, show='*')
+        # API Key
+        ttk.Label(frame, text="API 密钥:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.api_key_var = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=self.api_key_var, width=50, show='*')
         entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
         
-        # Login button
-        self.login_btn = ttk.Button(frame, text="🔑 登录并获取API Key", command=self._login_and_get_key)
-        self.login_btn.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
+        # Help text
+        help_text = "💡 提示：请在Web管理后台（个人中心-交易所配置）获取API Key"
+        ttk.Label(frame, text=help_text, foreground="gray", font=('Arial', 8)).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(5, 0)
+        )
         
         # Separator
         ttk.Separator(frame, orient='horizontal').grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
         
-        # API Key (read-only after login)
-        ttk.Label(frame, text="API 密钥:").grid(row=5, column=0, sticky=tk.W, pady=5)
-        self.api_key_var = tk.StringVar()
-        entry = ttk.Entry(frame, textvariable=self.api_key_var, width=50, show='*')
-        entry.grid(row=5, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-        entry.configure(state='readonly')
-        
-        # WebSocket URL
-        ttk.Label(frame, text="WS 地址:").grid(row=6, column=0, sticky=tk.W, pady=5)
-        self.ws_url_var = tk.StringVar(value="ws://39.105.150.99:8888/ws")
-        entry = ttk.Entry(frame, textvariable=self.ws_url_var, width=50)
-        entry.grid(row=6, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-        
         # Broker
-        ttk.Label(frame, text="券商类型:").grid(row=7, column=0, sticky=tk.W, pady=5)
+        ttk.Label(frame, text="券商类型:").grid(row=5, column=0, sticky=tk.W, pady=5)
         self.broker_var = tk.StringVar(value="simulation")
         combo = ttk.Combobox(frame, textvariable=self.broker_var,
                             values=['simulation', 'mt5', 'ibkr'],
                             state='readonly', width=20)
-        combo.grid(row=7, column=1, sticky=tk.W, padx=5, pady=5)
+        combo.grid(row=5, column=1, sticky=tk.W, padx=5, pady=5)
         
         # Save button
         btn = ttk.Button(frame, text="💾 保存配置", command=self._save_config)
-        btn.grid(row=7, column=2, padx=5, pady=5)
+        btn.grid(row=5, column=2, padx=5, pady=5)
     
     def _create_status_section(self, parent):
         """Create status display section."""
@@ -199,8 +184,6 @@ class QuantDingerApp:
     
     def _load_config(self):
         """Load configuration into UI."""
-        self.username_var.set(self.config_mgr.get('username', ''))
-        self.password_var.set(self.config_mgr.get('password', ''))
         self.api_key_var.set(self.config_mgr.get('api_key', ''))
         self.cloud_url_var.set(self.config_mgr.get('cloud_api_url', 'http://39.105.150.99:8888/api'))
         self.ws_url_var.set(self.config_mgr.get('cloud_url', 'ws://39.105.150.99:8888/ws'))
@@ -208,8 +191,6 @@ class QuantDingerApp:
     
     def _save_config(self):
         """Save configuration from UI."""
-        self.config_mgr.set('username', self.username_var.get())
-        self.config_mgr.set('password', self.password_var.get())
         self.config_mgr.set('api_key', self.api_key_var.get())
         self.config_mgr.set('cloud_api_url', self.cloud_url_var.get())
         self.config_mgr.set('cloud_url', self.ws_url_var.get())
@@ -221,85 +202,6 @@ class QuantDingerApp:
             messagebox.showinfo("成功", "配置保存成功！")
         except Exception as e:
             messagebox.showerror("错误", f"保存配置失败: {e}")
-    
-    def _login_and_get_key(self):
-        """Login to cloud and get/create API key."""
-        username = self.username_var.get().strip()
-        password = self.password_var.get().strip()
-        cloud_api_url = self.cloud_url_var.get().strip()
-        
-        if not username or not password:
-            messagebox.showwarning("提示", "请输入用户名和密码")
-            return
-        
-        if not cloud_api_url:
-            messagebox.showwarning("提示", "请输入云端地址")
-            return
-        
-        # Disable login button during operation
-        self.login_btn.configure(state='disabled')
-        self._log(f"正在登录: {username}...")
-        
-        # Run in separate thread to avoid blocking UI
-        def login_thread():
-            try:
-                # Initialize API client
-                api_client = CloudAPIClient(base_url=cloud_api_url)
-                
-                # Login
-                if not api_client.login(username, password):
-                    self.root.after(0, lambda: self._log("✗ 登录失败，请检查用户名和密码"))
-                    self.root.after(0, lambda: messagebox.showerror("错误", "登录失败，请检查用户名和密码"))
-                    self.root.after(0, lambda: self.login_btn.configure(state='normal'))
-                    return
-                
-                self.root.after(0, lambda: self._log(f"✓ 登录成功: {username}"))
-                
-                # Check if user already has an API key
-                keys = api_client.list_api_keys()
-                
-                if keys and len(keys) > 0:
-                    # Use existing active key
-                    active_keys = [k for k in keys if k.get('active')]
-                    if active_keys:
-                        # For security, we need to create a new key since we can't retrieve the full key
-                        self.root.after(0, lambda: self._log("发现已有API Key，创建新的Key..."))
-                    else:
-                        self.root.after(0, lambda: self._log("没有可用的API Key，创建新的Key..."))
-                
-                # Create new API key
-                result = api_client.create_api_key(
-                    key_name=f'LocalClient-{username}',
-                    description='本地交易客户端',
-                    expires_days=365
-                )
-                
-                if result and 'api_key' in result:
-                    api_key = result['api_key']
-                    
-                    # Update UI with the new API key
-                    self.root.after(0, lambda: self.api_key_var.set(api_key))
-                    self.root.after(0, lambda: self._log("✓ API Key获取成功"))
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "成功",
-                        f"登录成功！\n\nAPI Key已生成并自动填入配置。\n\n用户名: {username}\n请妥善保管您的API Key！"
-                    ))
-                    
-                    # Auto-save config
-                    self.root.after(100, self._save_config)
-                else:
-                    self.root.after(0, lambda: self._log("✗ 创建API Key失败"))
-                    self.root.after(0, lambda: messagebox.showerror("错误", "创建API Key失败"))
-                
-            except Exception as e:
-                self.root.after(0, lambda: self._log(f"✗ 登录错误: {str(e)}"))
-                self.root.after(0, lambda: messagebox.showerror("错误", f"登录错误: {str(e)}"))
-            finally:
-                self.root.after(0, lambda: self.login_btn.configure(state='normal'))
-        
-        # Start login thread
-        thread = threading.Thread(target=login_thread, daemon=True)
-        thread.start()
     
     def _log(self, message: str):
         """Add message to log."""
@@ -364,7 +266,7 @@ class QuantDingerApp:
         broker_type = self.broker_var.get().strip()
         
         if not api_key:
-            messagebox.showerror("错误", "请先登录并获取 API 密钥")
+            messagebox.showerror("错误", "请先在Web管理后台获取API Key并填入配置")
             return
         
         if not ws_url:
@@ -409,42 +311,45 @@ class QuantDingerApp:
             
             elif broker_type == 'mt5':
                 if not MT5_AVAILABLE:
-                    self._log("❌ MT5库未安装，请使用: pip install MetaTrader5")
-                    self._log("⚠️ 切换到模拟模式")
-                    self.broker = SimulationBroker(config={'initial_balance': 10000.0})
-                    loop.run_until_complete(self.broker.connect())
-                else:
-                    mt5_config = self.config_mgr.get('mt5', {})
-                    self.broker = MT5Broker(config=mt5_config)
-                    connected = loop.run_until_complete(self.broker.connect())
-                    if connected:
-                        self._log("✓ MT5券商已连接")
-                    else:
-                        self._log("❌ MT5连接失败，切换到模拟模式")
-                        self.broker = SimulationBroker(config={'initial_balance': 10000.0})
-                        loop.run_until_complete(self.broker.connect())
-            
+                    error_msg = "❌ MT5库未安装，请使用: pip install MetaTrader5"
+                    self._log(error_msg)
+                    self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
+                    raise RuntimeError(error_msg)
+                            
+                mt5_config = self.config_mgr.get('mt5', {})
+                self.broker = MT5Broker(config=mt5_config)
+                connected = loop.run_until_complete(self.broker.connect())
+                if not connected:
+                    error_msg = "❌ MT5连接失败，请检查MT5终端是否运行且已登录账户"
+                    self._log(error_msg)
+                    self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
+                    raise RuntimeError(error_msg)
+                            
+                self._log("✓ MT5券商已连接")
+                        
             elif broker_type == 'ibkr':
                 if not IBKR_AVAILABLE:
-                    self._log("❌ ib_insync库未安装，请使用: pip install ib_insync")
-                    self._log("⚠️ 切换到模拟模式")
-                    self.broker = SimulationBroker(config={'initial_balance': 10000.0})
-                    loop.run_until_complete(self.broker.connect())
-                else:
-                    ibkr_config = self.config_mgr.get('ibkr', {})
-                    self.broker = IBKRBroker(config=ibkr_config)
-                    connected = loop.run_until_complete(self.broker.connect())
-                    if connected:
-                        self._log("✓ IBKR券商已连接")
-                    else:
-                        self._log("❌ IBKR连接失败，切换到模拟模式")
-                        self.broker = SimulationBroker(config={'initial_balance': 10000.0})
-                        loop.run_until_complete(self.broker.connect())
-            
+                    error_msg = "❌ ib_insync库未安装，请使用: pip install ib_insync"
+                    self._log(error_msg)
+                    self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
+                    raise RuntimeError(error_msg)
+                            
+                ibkr_config = self.config_mgr.get('ibkr', {})
+                self.broker = IBKRBroker(config=ibkr_config)
+                connected = loop.run_until_complete(self.broker.connect())
+                if not connected:
+                    error_msg = "❌ IBKR连接失败，请检查TWS/Gateway是否运行且端口正确"
+                    self._log(error_msg)
+                    self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
+                    raise RuntimeError(error_msg)
+                            
+                self._log("✓ IBKR券商已连接")
+                        
             else:
-                self._log(f"⚠️ 未知券商类型 '{broker_type}'，使用模拟模式")
-                self.broker = SimulationBroker(config={'initial_balance': 10000.0})
-                loop.run_until_complete(self.broker.connect())
+                error_msg = f" 不支持的券商类型: {broker_type}。支持的类型: simulation, mt5, ibkr"
+                self._log(error_msg)
+                self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
+                raise RuntimeError(error_msg)
             
             # Initialize risk manager
             risk_config = self.config_mgr.get('risk_management', {})

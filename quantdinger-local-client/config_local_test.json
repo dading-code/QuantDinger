@@ -1,0 +1,8 @@
+{
+  "username": "testuser",
+  "password": "testuser123",
+  "api_key": "",
+  "cloud_api_url": "http://localhost:5000/api",
+  "cloud_url": "ws://localhost:8765/ws",
+  "broker": "simulation"
+}
