@@ -1892,3 +1892,177 @@ def get_admin_ai_stats():
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+# ============================================================================
+# API Key Management Routes (用户API Key管理)
+# ============================================================================
+
+@user_bp.route('/api-key/create', methods=['POST'])
+@login_required
+def create_api_key():
+    """
+    为当前用户创建新的API Key
+    
+    Request body:
+        key_name: str (optional, default 'Default')
+        description: str (optional, default '')
+        expires_days: int (optional, default 365, 0表示永不过期)
+    """
+    try:
+        from app.services.api_key_manager import APIKeyService
+        
+        user_id = g.user_id
+        data = request.get_json() or {}
+        
+        key_name = data.get('key_name', 'Default')
+        description = data.get('description', '')
+        expires_days = data.get('expires_days', 365)
+        
+        # Validate input
+        if not key_name or len(key_name) > 100:
+            return jsonify({
+                'code': 0,
+                'msg': '密钥名称不能为空且不能超过100个字符',
+                'data': None
+            }), 400
+        
+        if len(description) > 500:
+            return jsonify({
+                'code': 0,
+                'msg': '描述不能超过500个字符',
+                'data': None
+            }), 400
+        
+        result = APIKeyService.create_api_key(
+            user_id=user_id,
+            key_name=key_name,
+            description=description,
+            expires_days=expires_days
+        )
+        
+        logger.info(f"User {user_id} created new API key: {key_name}")
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'API Key创建成功，请妥善保存（只显示一次）',
+            'data': result
+        })
+    except Exception as e:
+        logger.error(f"create_api_key failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/api-key/list', methods=['GET'])
+@login_required
+def list_api_keys():
+    """
+    获取当前用户的所有API Key列表
+    """
+    try:
+        from app.services.api_key_manager import APIKeyService
+        
+        user_id = g.user_id
+        keys = APIKeyService.get_user_api_keys(user_id)
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'keys': keys,
+                'total': len(keys)
+            }
+        })
+    except Exception as e:
+        logger.error(f"list_api_keys failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/api-key/revoke', methods=['POST'])
+@login_required
+def revoke_api_key():
+    """
+    停用指定的API Key
+    
+    Request body:
+        key_id: int (required)
+    """
+    try:
+        from app.services.api_key_manager import APIKeyService
+        
+        user_id = g.user_id
+        data = request.get_json() or {}
+        key_id = data.get('key_id')
+        
+        if not key_id:
+            return jsonify({
+                'code': 0,
+                'msg': '缺少key_id参数',
+                'data': None
+            }), 400
+        
+        success = APIKeyService.revoke_api_key(user_id, key_id)
+        
+        if not success:
+            return jsonify({
+                'code': 0,
+                'msg': 'API Key不存在或不属于当前用户',
+                'data': None
+            }), 404
+        
+        logger.info(f"User {user_id} revoked API key: {key_id}")
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'API Key已停用',
+            'data': None
+        })
+    except Exception as e:
+        logger.error(f"revoke_api_key failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/api-key/delete', methods=['DELETE'])
+@login_required
+def delete_api_key():
+    """
+    删除指定的API Key
+    
+    Request body:
+        key_id: int (required)
+    """
+    try:
+        from app.services.api_key_manager import APIKeyService
+        
+        user_id = g.user_id
+        data = request.get_json() or {}
+        key_id = data.get('key_id')
+        
+        if not key_id:
+            return jsonify({
+                'code': 0,
+                'msg': '缺少key_id参数',
+                'data': None
+            }), 400
+        
+        success = APIKeyService.delete_api_key(user_id, key_id)
+        
+        if not success:
+            return jsonify({
+                'code': 0,
+                'msg': 'API Key不存在或不属于当前用户',
+                'data': None
+            }), 404
+        
+        logger.info(f"User {user_id} deleted API key: {key_id}")
+        
+        return jsonify({
+            'code': 1,
+            'msg': 'API Key已删除',
+            'data': None
+        })
+    except Exception as e:
+        logger.error(f"delete_api_key failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500

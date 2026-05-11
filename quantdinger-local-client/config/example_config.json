@@ -1,0 +1,14 @@
+{
+  "api_key": "",
+  "cloud_url": "ws://localhost:8765/ws",
+  "broker": "simulation",
+  "risk_management": {
+    "max_position_size": 0.02,
+    "max_daily_loss": 0.05,
+    "max_open_positions": 5,
+    "stop_loss_pct": 0.02,
+    "take_profit_pct": 0.04,
+    "symbol_whitelist": [],
+    "symbol_blacklist": []
+  }
+}

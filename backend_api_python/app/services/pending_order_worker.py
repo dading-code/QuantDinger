@@ -8,10 +8,12 @@ This worker polls `pending_orders` periodically and dispatches orders based on `
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.signal_notifier import SignalNotifier
@@ -762,6 +764,39 @@ class PendingOrderWorker:
                 notification_config=notification_config if isinstance(notification_config, dict) else {},
                 extra={"pending_order_id": order_id, "mode": mode},
             )
+
+            # Broadcast signal via WebSocket to local trade executors
+            try:
+                from app.services.websocket_signal import get_signal_hub
+                hub = get_signal_hub()
+                
+                # Prepare WebSocket signal payload
+                ws_signal = {
+                    "strategy_id": int(strategy_id or 0),
+                    "strategy_name": str(strategy_name or ""),
+                    "symbol": str(symbol or ""),
+                    "signal_type": str(signal_type or ""),
+                    "price": float(price or 0.0),
+                    "stake_amount": float(amount or 0.0),
+                    "direction": str(direction or "long"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "pending_order_id": order_id,
+                    "execution_mode": mode,
+                    "notification_results": {
+                        c: {"ok": (r or {}).get("ok", False), "error": (r or {}).get("error", "")}
+                        for c, r in results.items()
+                    },
+                }
+                
+                # Async broadcast (non-blocking)
+                asyncio.run_coroutine_threadsafe(
+                    hub.broadcast_signal(ws_signal),
+                    asyncio.new_event_loop()
+                )
+                logger.debug(f"Signal broadcasted via WebSocket: {signal_type} {symbol}")
+            except Exception as ws_error:
+                # Don't fail the notification if WebSocket broadcast fails
+                logger.warning(f"WebSocket broadcast failed (non-critical): {ws_error}")
 
             attempted = list(results.keys())
             ok_channels = [c for c, r in results.items() if (r or {}).get("ok")]
