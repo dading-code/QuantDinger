@@ -29,6 +29,7 @@ def register_routes(app: Flask):
     from app.routes.polymarket import polymarket_bp
     from app.routes.experiment import experiment_bp
     from app.routes.websocket import websocket_bp
+    from app.routes.local_client import local_client_bp
     
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp, url_prefix='/api/auth')   # Auth routes
@@ -53,6 +54,7 @@ def register_routes(app: Flask):
     app.register_blueprint(polymarket_bp, url_prefix='/api/polymarket')
     app.register_blueprint(experiment_bp, url_prefix='/api/experiment')
     app.register_blueprint(websocket_bp, url_prefix='/api/websocket')
+    app.register_blueprint(local_client_bp, url_prefix='/api/local-client')  # Local client execution reports
 
     # Agent Gateway (/api/agent/v1) — versioned, scoped surface for AI agents.
     # See docs/agent/AI_INTEGRATION_DESIGN.md.

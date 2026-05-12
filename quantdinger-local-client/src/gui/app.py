@@ -304,6 +304,8 @@ class QuantDingerApp:
             # Initialize broker
             self._log(f"初始化券商: {broker_type}")
             
+            broker_account_id = None
+            
             if broker_type == 'simulation':
                 self.broker = SimulationBroker(config={'initial_balance': 10000.0})
                 loop.run_until_complete(self.broker.connect())
@@ -320,12 +322,20 @@ class QuantDingerApp:
                 self.broker = MT5Broker(config=mt5_config)
                 connected = loop.run_until_complete(self.broker.connect())
                 if not connected:
-                    error_msg = "❌ MT5连接失败，请检查MT5终端是否运行且已登录账户"
+                    error_msg = " MT5连接失败，请检查MT5终端是否运行且已登录账户"
                     self._log(error_msg)
                     self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
                     raise RuntimeError(error_msg)
                             
-                self._log("✓ MT5券商已连接")
+                # 获取实际登录的MT5账号
+                import MetaTrader5 as mt5
+                account_info = mt5.account_info()
+                if account_info:
+                    broker_account_id = str(account_info.login)
+                    self._log(f"✓ MT5券商已连接 (账号: {broker_account_id})")
+                else:
+                    broker_account_id = None
+                    self._log("✓ MT5券商已连接")
                         
             elif broker_type == 'ibkr':
                 if not IBKR_AVAILABLE:
@@ -342,8 +352,13 @@ class QuantDingerApp:
                     self._log(error_msg)
                     self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
                     raise RuntimeError(error_msg)
-                            
-                self._log("✓ IBKR券商已连接")
+                
+                # 获取实际登录的IBKR账号
+                if self.broker.ib.accountID:
+                    broker_account_id = str(self.broker.ib.accountID)
+                    self._log(f"✓ IBKR券商已连接 (账号: {broker_account_id})")
+                else:
+                    self._log("✓ IBKR券商已连接")
                         
             else:
                 error_msg = f" 不支持的券商类型: {broker_type}。支持的类型: simulation, mt5, ibkr"
@@ -360,6 +375,9 @@ class QuantDingerApp:
             self.signal_processor = SignalProcessor(self.broker, self.risk_manager)
             self._log("✓ 信号处理器已就绪")
             
+            # Log WebSocket connection attempt
+            self._log(f"正在连接 WebSocket: {cloud_url}")
+            
             # Create signal client with callbacks
             client = SignalClient(
                 api_key=api_key,
@@ -367,6 +385,8 @@ class QuantDingerApp:
                 on_signal=self._on_signal,
                 on_connect=lambda _: self.root.after(0, lambda: self._update_status(True)),
                 on_disconnect=lambda: self.root.after(0, lambda: self._update_status(False)),
+                on_error=lambda msg: self.root.after(0, lambda: self._log(f"❌ {msg}")),  # 新增错误回调
+                broker_account_id=broker_account_id,  # 传递券商账号ID
             )
             
             self.signal_client = client

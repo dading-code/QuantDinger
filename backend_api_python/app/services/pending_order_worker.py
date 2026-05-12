@@ -3,7 +3,11 @@ Pending order worker.
 
 This worker polls `pending_orders` periodically and dispatches orders based on `execution_mode`:
 - signal: send notifications (no real trading).
-- live: not implemented (paper mode only).
+- live: execute via exchange API (crypto) or push to local client (MT5/IBKR).
+
+Architecture:
+- Crypto exchanges: Cloud executes directly via REST API
+- MT5/IBKR: Cloud pushes signal to local client via WebSocket, local client executes
 """
 
 from __future__ import annotations
@@ -866,6 +870,149 @@ class PendingOrderWorker:
         except Exception:
             return ""
 
+    def _push_signal_to_local_client(
+        self,
+        *,
+        order_id: int,
+        order_row: Dict[str, Any],
+        payload: Dict[str, Any],
+        strategy_id: int,
+        exchange_id: str,
+        market_category: str,
+        _notify_live_best_effort,
+        _console_print,
+    ) -> None:
+        """
+        Push MT5/IBKR signal to local client via WebSocket.
+        
+        Two-phase operation:
+        Phase 1: Mark order as 'signal_pushed' (waiting for local execution)
+        Phase 2: Local client executes and reports back via API (not implemented yet)
+        
+        Retry mechanism:
+        - If WebSocket push fails, retry up to MAX_RETRY times with exponential backoff
+        - If timeout (no response from local client), mark as failed
+        """
+        MAX_RETRY = 3
+        RETRY_DELAY_BASE = 2  # seconds
+        
+        signal_type = payload.get("signal_type") or order_row.get("signal_type")
+        symbol = payload.get("symbol") or order_row.get("symbol")
+        amount = float(payload.get("amount") or order_row.get("amount") or 0.0)
+        price = float(payload.get("price") or order_row.get("ref_price") or 0.0)
+        
+        _console_print(f"[worker] Pushing {exchange_id} signal to local client: strategy_id={strategy_id} pending_id={order_id}")
+        
+        # Prepare signal data
+        signal_data = {
+            'type': 'trading_signal',
+            'strategy_id': strategy_id,
+            'symbol': symbol,
+            'signal_type': signal_type,
+            'amount': amount,
+            'price': price,
+            'market_category': market_category,
+            'exchange_id': exchange_id,
+            'pending_order_id': order_id,
+            'timestamp': int(time.time()),
+            'retry_count': 0,  # Will be incremented on retry
+        }
+        
+        # Get user_id for this strategy
+        try:
+            cfg = load_strategy_configs(strategy_id)
+            user_id = int(cfg.get("user_id") or 1)
+        except Exception as e:
+            logger.error(f"Failed to get user_id for strategy {strategy_id}: {e}")
+            self._mark_failed(order_id=order_id, error=f"get_user_id_failed:{e}")
+            _notify_live_best_effort(status="failed", error=f"get_user_id_failed:{e}")
+            return
+        
+        # Try to push signal via WebSocket with retry
+        success = False
+        last_error = None
+        
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                from app.services.websocket_signal import get_signal_hub
+                hub = get_signal_hub()
+                
+                # Check if there are any connected clients for this user
+                active_clients = sum(
+                    1 for meta in hub.client_metadata.values()
+                    if meta.get('user_id') == user_id
+                )
+                
+                if active_clients == 0:
+                    logger.warning(
+                        f"No active local clients for user {user_id}, "
+                        f"signal will wait until client connects (attempt {attempt}/{MAX_RETRY})"
+                    )
+                    last_error = "no_active_clients"
+                    
+                    # Wait before retry (exponential backoff)
+                    if attempt < MAX_RETRY:
+                        wait_time = RETRY_DELAY_BASE * (2 ** (attempt - 1))
+                        time.sleep(wait_time)
+                    continue
+                
+                # Broadcast signal to user's clients
+                asyncio.run(hub.broadcast_signal(signal_data, target_user_id=user_id))
+                
+                success = True
+                logger.info(
+                    f"Signal pushed successfully: user={user_id} exchange={exchange_id} "
+                    f"pending_id={order_id} clients={active_clients}"
+                )
+                break
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(
+                    f"Failed to push signal (attempt {attempt}/{MAX_RETRY}): {e}"
+                )
+                
+                # Wait before retry (exponential backoff)
+                if attempt < MAX_RETRY:
+                    wait_time = RETRY_DELAY_BASE * (2 ** (attempt - 1))
+                    time.sleep(wait_time)
+        
+        if success:
+            # Phase 1: Mark order as 'signal_pushed' (waiting for local execution)
+            self._mark_sent(
+                order_id=order_id,
+                note=f"signal_pushed_to_local_client_{exchange_id}",
+                exchange_id=exchange_id,
+                exchange_order_id="",
+                exchange_response_json=json.dumps({
+                    'status': 'pushed',
+                    'message': 'Signal sent to local client, waiting for execution report'
+                }, ensure_ascii=False),
+                filled=0.0,
+                avg_price=price,
+                executed_at=int(time.time()),
+            )
+            _console_print(
+                f"[worker] Signal pushed: strategy_id={strategy_id} pending_id={order_id} "
+                f"exchange={exchange_id} status=waiting_for_local_execution"
+            )
+            _notify_live_best_effort(
+                status="pushed",
+                exchange_id=exchange_id,
+                error="",
+            )
+            append_strategy_log(
+                strategy_id, "info",
+                f"Signal pushed to local client: {signal_type} {symbol} amount={amount} (exchange={exchange_id})"
+            )
+        else:
+            # All retries failed
+            error_msg = f"signal_push_failed_after_{MAX_RETRY}_retries:{last_error}"
+            self._mark_failed(order_id=order_id, error=error_msg)
+            _console_print(f"[worker] Signal push failed: strategy_id={strategy_id} pending_id={order_id} err={last_error}")
+            _notify_live_best_effort(status="failed", error=error_msg)
+            append_strategy_log(strategy_id, "error", f"Failed to push signal to local client: {last_error}")
+
     def _execute_live_order(self, *, order_id: int, order_row: Dict[str, Any], payload: Dict[str, Any]) -> None:
         """
         Execute a pending order using direct exchange REST clients (no ccxt).
@@ -1010,7 +1157,7 @@ class PendingOrderWorker:
             append_strategy_log(strategy_id, "error", f"Exchange client creation failed ({exchange_id}): {e}")
             return
 
-        # Check if this is an IBKR client (US stocks)
+        # Check if this is an IBKR client (US stocks) - Push to local client instead of executing in cloud
         global IBKRClient
         if IBKRClient is None:
             try:
@@ -1020,20 +1167,20 @@ class PendingOrderWorker:
                 pass
 
         if IBKRClient is not None and isinstance(client, IBKRClient):
-            # Execute IBKR order (separate flow for stocks)
-            self._execute_ibkr_order(
+            # IBKR orders must be executed by local client, push signal via WebSocket
+            self._push_signal_to_local_client(
                 order_id=order_id,
                 order_row=order_row,
                 payload=payload,
-                client=client,
                 strategy_id=strategy_id,
-                exchange_config=exchange_config,
+                exchange_id="ibkr",
+                market_category=market_category,
                 _notify_live_best_effort=_notify_live_best_effort,
                 _console_print=_console_print,
             )
             return
 
-        # Check if this is an MT5 client (Forex)
+        # Check if this is an MT5 client (Forex) - Push to local client instead of executing in cloud
         global MT5Client
         if MT5Client is None:
             try:
@@ -1043,14 +1190,14 @@ class PendingOrderWorker:
                 pass
 
         if MT5Client is not None and isinstance(client, MT5Client):
-            # Execute MT5 order (separate flow for forex)
-            self._execute_mt5_order(
+            # MT5 orders must be executed by local client, push signal via WebSocket
+            self._push_signal_to_local_client(
                 order_id=order_id,
                 order_row=order_row,
                 payload=payload,
-                client=client,
                 strategy_id=strategy_id,
-                exchange_config=exchange_config,
+                exchange_id="mt5",
+                market_category=market_category,
                 _notify_live_best_effort=_notify_live_best_effort,
                 _console_print=_console_print,
             )

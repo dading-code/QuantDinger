@@ -10,6 +10,7 @@ User API Key Management Service
 
 import secrets
 import hashlib
+import json
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from app.utils.db import get_db_connection
@@ -47,7 +48,8 @@ class APIKeyService:
     
     @staticmethod
     def create_api_key(user_id: int, key_name: str = 'Default', 
-                       description: str = '', expires_days: int = 365) -> Dict:
+                       description: str = '', expires_days: int = 365,
+                       credential_id: int = None) -> Dict:
         """
         为用户创建新的API Key
         
@@ -56,6 +58,7 @@ class APIKeyService:
             key_name: Key名称
             description: 描述
             expires_days: 过期天数（0表示永不过期）
+            credential_id: 绑定的交易所配置ID（可选）
             
         Returns:
             包含api_key和key_info的字典
@@ -73,52 +76,53 @@ class APIKeyService:
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute("""
-                INSERT INTO qd_api_keys (user_id, api_key, key_name, description, 
+                INSERT INTO qd_api_keys (user_id, credential_id, api_key, key_name, description, 
                                         active, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id, created_at
-            """, (user_id, api_key_hash, key_name, description, True, expires_at))
+            """, (user_id, credential_id, api_key_hash, key_name, description, True, expires_at))
             
             result = cur.fetchone()
             db.commit()
             cur.close()
         
-        logger.info(f"Created API key for user {user_id}: {key_name} (ID: {result[0]})")
+        logger.info(f"Created API key for user {user_id}: {key_name} (ID: {result['id']}, credential: {credential_id})")
         
         return {
             'api_key': api_key,  # 只在创建时返回一次
             'key_info': {
-                'id': result[0],
+                'id': result['id'],
                 'key_name': key_name,
                 'description': description,
+                'credential_id': credential_id,
                 'active': True,
                 'expires_at': expires_at.isoformat() if expires_at else None,
-                'created_at': result[1].isoformat() if result[1] else None
+                'created_at': result['created_at'].isoformat() if result['created_at'] else None
             }
         }
     
     @staticmethod
     def validate_api_key(api_key: str) -> Optional[Dict]:
         """
-        验证API Key并返回用户信息
+        验证API Key并返回用户信息和绑定的交易所配置
         
         Args:
             api_key: API Key字符串
             
         Returns:
-            如果有效，返回用户信息字典；否则返回None
+            如果有效，返回用户信息和credential信息字典；否则返回None
         """
         api_key_hash = APIKeyService.hash_api_key(api_key)
         
         with get_db_connection() as db:
             cur = db.cursor()
             
-            # 查询API Key
+            # 查询API Key（包含credential_id）
             cur.execute("""
-                SELECT ak.id, ak.user_id, ak.key_name, ak.active, 
+                SELECT ak.id, ak.user_id, ak.credential_id, ak.key_name, ak.active, 
                        ak.expires_at, ak.last_used_at
                 FROM qd_api_keys ak
-                WHERE ak.api_key = ?
+                WHERE ak.api_key = %s
             """, (api_key_hash,))
             
             key_row = cur.fetchone()
@@ -144,7 +148,7 @@ class APIKeyService:
             cur.execute("""
                 UPDATE qd_api_keys 
                 SET last_used_at = NOW()
-                WHERE id = ?
+                WHERE id = %s
             """, (key_row['id'],))
             db.commit()
             
@@ -152,26 +156,58 @@ class APIKeyService:
             cur.execute("""
                 SELECT id, username, email, role, status
                 FROM qd_users
-                WHERE id = ?
+                WHERE id = %s
             """, (key_row['user_id'],))
             
             user = cur.fetchone()
-            cur.close()
             
             if not user or user['status'] != 'active':
+                cur.close()
                 logger.warning(f"User is inactive: {key_row['user_id']}")
                 return None
             
-            logger.info(f"API key validated for user: {user['username']}")
+            # 获取credential信息（如果绑定了）
+            credential_info = None
+            credential_id = key_row['credential_id']
+            if credential_id:
+                from app.utils.credential_crypto import decrypt_credential_blob
+                cur.execute("""
+                    SELECT id, exchange_id, encrypted_config
+                    FROM qd_exchange_credentials
+                    WHERE id = %s AND user_id = %s
+                """, (credential_id, key_row['user_id']))
+                cred_row = cur.fetchone()
+                
+                if cred_row:
+                    try:
+                        config_json = decrypt_credential_blob(cred_row['encrypted_config'])
+                        config = json.loads(config_json) if isinstance(config_json, str) else config_json
+                        credential_info = {
+                            'id': cred_row['id'],
+                            'exchange_id': cred_row['exchange_id'],
+                            'config': config
+                        }
+                    except Exception as e:
+                        logger.warning(f"Failed to decrypt credential {credential_id}: {e}")
             
-            return {
+            cur.close()
+            
+            logger.info(f"API key validated for user: {user['username']} (credential: {credential_id})")
+            
+            result = {
                 'user_id': user['id'],
                 'username': user['username'],
                 'email': user['email'],
                 'role': user['role'],
                 'key_id': key_row['id'],
-                'key_name': key_row['key_name']
+                'key_name': key_row['key_name'],
+                'credential_id': credential_id,
             }
+            
+            if credential_info:
+                result['credential'] = credential_info
+            
+            return result
     
     @staticmethod
     def get_user_api_keys(user_id: int) -> List[Dict]:
@@ -187,10 +223,10 @@ class APIKeyService:
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute("""
-                SELECT id, api_key, key_name, description, active, 
+                SELECT id, api_key, credential_id, key_name, description, active, 
                        expires_at, last_used_at, created_at
                 FROM qd_api_keys
-                WHERE user_id = ?
+                WHERE user_id = %s
                 ORDER BY created_at DESC
             """, (user_id,))
             
@@ -206,6 +242,7 @@ class APIKeyService:
             result.append({
                 'id': key['id'],
                 'api_key_prefix': prefix,
+                'credential_id': key['credential_id'],
                 'key_name': key['key_name'],
                 'description': key['description'],
                 'active': key['active'],
@@ -233,7 +270,7 @@ class APIKeyService:
             cur.execute("""
                 UPDATE qd_api_keys 
                 SET active = FALSE, updated_at = NOW()
-                WHERE id = ? AND user_id = ?
+                WHERE id = %s AND user_id = %s
             """, (key_id, user_id))
             
             affected = cur.rowcount
@@ -261,7 +298,7 @@ class APIKeyService:
             cur = db.cursor()
             cur.execute("""
                 DELETE FROM qd_api_keys
-                WHERE id = ? AND user_id = ?
+                WHERE id = %s AND user_id = %s
             """, (key_id, user_id))
             
             affected = cur.rowcount

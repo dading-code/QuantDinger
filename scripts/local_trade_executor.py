@@ -179,10 +179,12 @@ class LocalTradeExecutor:
         signal = signal_data.get('data', {})
         signal_id = signal_data.get('signal_id', 'N/A')
         timestamp = signal_data.get('timestamp', '')
+        pending_order_id = signal.get('pending_order_id')  # Get pending order ID from cloud
         
         print(f"\n{'='*80}")
         print(f"[Signal #{self.signal_count}] Received at {timestamp}")
         print(f"Signal ID: {signal_id}")
+        print(f"Pending Order ID: {pending_order_id}")
         print(f"Strategy: {signal.get('strategy_name', 'N/A')}")
         print(f"Symbol: {signal.get('symbol', 'N/A')}")
         print(f"Type: {signal.get('signal_type', 'N/A')}")
@@ -193,6 +195,13 @@ class LocalTradeExecutor:
         # Validate signal
         if not self._validate_signal(signal):
             print(f"[Validation] ✗ Signal rejected")
+            # Report validation failure to cloud
+            if pending_order_id:
+                await self._report_execution_result(
+                    pending_order_id=pending_order_id,
+                    success=False,
+                    error="Signal validation failed"
+                )
             return
         
         print(f"[Validation] ✓ Signal accepted")
@@ -200,17 +209,46 @@ class LocalTradeExecutor:
         # Execute trade
         try:
             result = await self._execute_trade(signal)
-            if result.get('success'):
-                self.trade_count += 1
-                print(f"[Execution] ✓ Trade executed successfully")
-                print(f"  Order ID: {result.get('order_id')}")
-                print(f"  Filled: {result.get('filled')}")
-                print(f"  Price: {result.get('price')}")
+            
+            # Report execution result to cloud
+            if pending_order_id:
+                if result.get('success'):
+                    await self._report_execution_result(
+                        pending_order_id=pending_order_id,
+                        success=True,
+                        order_id=result.get('order_id'),
+                        filled=result.get('filled'),
+                        price=result.get('price'),
+                    )
+                    self.trade_count += 1
+                    print(f"[Execution] ✓ Trade executed successfully")
+                    print(f"  Order ID: {result.get('order_id')}")
+                    print(f"  Filled: {result.get('filled')}")
+                    print(f"  Price: {result.get('price')}")
+                else:
+                    await self._report_execution_result(
+                        pending_order_id=pending_order_id,
+                        success=False,
+                        error=result.get('error', 'Unknown error')
+                    )
+                    print(f"[Execution] ✗ Trade failed: {result.get('error')}")
             else:
-                print(f"[Execution] ✗ Trade failed: {result.get('error')}")
+                # No pending_order_id, just log locally
+                if result.get('success'):
+                    self.trade_count += 1
+                    print(f"[Execution] ✓ Trade executed successfully (no cloud report)")
+                else:
+                    print(f"[Execution] ✗ Trade failed: {result.get('error')}")
         
         except Exception as e:
             print(f"[Execution] ✗ Trade execution error: {e}")
+            # Report exception to cloud
+            if pending_order_id:
+                await self._report_execution_result(
+                    pending_order_id=pending_order_id,
+                    success=False,
+                    error=str(e)
+                )
     
     def _validate_signal(self, signal: Dict[str, Any]) -> bool:
         """Validate trading signal against risk rules."""
@@ -399,6 +437,70 @@ class LocalTradeExecutor:
             'filled': signal.get('stake_amount', 0.1),
             'price': signal.get('price', 0),
         }
+    
+    async def _report_execution_result(
+        self,
+        pending_order_id: int,
+        success: bool,
+        order_id: str = None,
+        filled: float = None,
+        price: float = None,
+        error: str = None,
+        max_retries: int = 3,
+    ):
+        """
+        Report execution result back to cloud.
+        
+        Two-phase operation:
+        Phase 2: Local client reports execution result after executing the order.
+        
+        Retry mechanism:
+        - If HTTP request fails, retry up to max_retries times with exponential backoff
+        - Prevents infinite loops by limiting retries
+        """
+        import aiohttp
+        
+        report_data = {
+            'api_key': self.api_key,
+            'pending_order_id': pending_order_id,
+            'success': success,
+        }
+        
+        if success:
+            report_data['order_id'] = order_id or ''
+            report_data['filled'] = filled or 0.0
+            report_data['price'] = price or 0.0
+        else:
+            report_data['error'] = error or 'Unknown error'
+        
+        cloud_url = self.cloud_url.replace('ws://', 'http://').replace('wss://', 'https://')
+        report_url = f"{cloud_url}/api/local-client/report-execution"
+        
+        print(f"[Report] Reporting execution result to cloud: pending_id={pending_order_id} success={success}")
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(report_url, json=report_data, timeout=10) as response:
+                        result = await response.json()
+                        
+                        if response.status == 200 and result.get('code') == 1:
+                            print(f"[Report] ✓ Execution result reported successfully (attempt {attempt})")
+                            return True
+                        else:
+                            print(f"[Report] ✗ Cloud returned error: {result.get('msg', 'Unknown')}")
+                            
+            except Exception as e:
+                print(f"[Report] ✗ Failed to report (attempt {attempt}/{max_retries}): {e}")
+            
+            # Wait before retry (exponential backoff)
+            if attempt < max_retries:
+                wait_time = 2 * (2 ** (attempt - 1))  # 2s, 4s, 8s
+                print(f"[Report] Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+        
+        print(f"[Report] ✗ Failed to report after {max_retries} retries")
+        return False
     
     def _initialize_broker(self):
         """Initialize broker connection."""

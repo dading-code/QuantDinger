@@ -2,6 +2,7 @@
 websockets>=12.0
 cryptography>=41.0.0
 requests>=2.31.0
+aiohttp>=3.9.0  # For async HTTP requests (reporting execution results)
 
 # Optional: Broker integrations
 # MetaTrader5>=5.0.45  # Windows only - for MT5 trading

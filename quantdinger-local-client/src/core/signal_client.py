@@ -38,6 +38,8 @@ class SignalClient:
         on_signal: Optional[Callable] = None,
         on_connect: Optional[Callable] = None,
         on_disconnect: Optional[Callable] = None,
+        on_error: Optional[Callable] = None,  # 新增：错误回调
+        broker_account_id: Optional[str] = None,  # 新增：券商实际账号ID
     ):
         """
         Initialize the signal client.
@@ -60,6 +62,8 @@ class SignalClient:
         self.on_signal = on_signal
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
+        self.on_error = on_error  # 错误回调
+        self.broker_account_id = broker_account_id  # 券商实际账号ID
         
         # State
         self.connected = False
@@ -84,20 +88,38 @@ class SignalClient:
                 
                 async with websockets.connect(self.cloud_url) as websocket:
                     self.websocket = websocket
-                    logger.info("✓ Connected!")
+                    logger.info("✓ TCP Connection established!")
                     
                     # Authenticate
+                    logger.info(" Starting authentication...")
                     await self._authenticate(websocket)
                     
                     # Listen for messages
                     await self._message_loop(websocket)
             
             except (ConnectionClosed, ConnectionClosedError) as e:
-                logger.warning(f"Connection closed: {e}")
+                error_msg = f"❌ Connection closed unexpectedly"
+                logger.warning(error_msg)
+                logger.warning(f"   Code: {e.code}")
+                logger.warning(f"   Reason: {e.reason}")
+                logger.warning(f"   Exception type: {type(e).__name__}")
+                
+                full_error = f"WebSocket连接关闭: code={e.code}, reason={e.reason}"
+                if self.on_error:
+                    try:
+                        self.on_error(full_error)
+                    except:
+                        pass
                 self._handle_disconnect()
             
             except Exception as e:
                 logger.error(f"Connection error: {e}")
+                error_msg = f"WebSocket连接错误: {str(e)}"
+                if self.on_error:
+                    try:
+                        self.on_error(error_msg)
+                    except:
+                        pass
                 self._handle_disconnect()
             
             # Reconnect with exponential backoff
@@ -113,23 +135,38 @@ class SignalClient:
             'api_key': self.api_key,
             'client_type': 'signal_client',
             'timestamp': datetime.now(timezone.utc).isoformat(),
+            'broker_account_id': self.broker_account_id,  # 上报实际券商账号
         }
+        
+        # Log authentication details (mask API key for security)
+        api_key_display = self.api_key[:8] + "..." + self.api_key[-4:] if len(self.api_key) > 12 else "***"
+        logger.info(f"📤 Sending auth - API Key: {api_key_display}, Broker: {self.broker_account_id}")
+        logger.info(f"   Full auth message: {json.dumps(auth_message)}")
+        
         await websocket.send(json.dumps(auth_message))
-        logger.info("Authentication sent")
+        logger.info("✓ Auth message sent, waiting for response...")
         
         # Wait for confirmation
-        response = await asyncio.wait_for(websocket.recv(), timeout=10)
-        data = json.loads(response)
-        
-        if data.get('type') == 'connection_established':
-            logger.info(f"✓ Authentication successful (Client ID: {data.get('client_id')})")
-            self.connected = True
-            self.reconnect_delay = 5  # Reset delay
+        try:
+            response = await asyncio.wait_for(websocket.recv(), timeout=10)
+            data = json.loads(response)
+            logger.info(f"📥 Received response: {json.dumps(data)}")
             
-            if self.on_connect:
-                self.on_connect(data)
-        else:
-            raise Exception(f"Authentication failed: {data}")
+            if data.get('type') == 'connection_established':
+                logger.info(f"✓ Authentication successful (Client ID: {data.get('client_id')})")
+                self.connected = True
+                self.reconnect_delay = 5  # Reset delay
+                
+                if self.on_connect:
+                    self.on_connect(data)
+            else:
+                error_msg = f"❌ Authentication failed: {data}"
+                logger.error(error_msg)
+                raise Exception(error_msg)
+        except asyncio.TimeoutError:
+            error_msg = " Authentication timeout - no response from server"
+            logger.error(error_msg)
+            raise Exception(error_msg)
     
     async def _message_loop(self, websocket):
         """Main message processing loop."""

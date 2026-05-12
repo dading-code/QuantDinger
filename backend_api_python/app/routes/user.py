@@ -1908,6 +1908,7 @@ def create_api_key():
         key_name: str (optional, default 'Default')
         description: str (optional, default '')
         expires_days: int (optional, default 365, 0表示永不过期)
+        credential_id: int (optional, 绑定的交易所配置ID)
     """
     try:
         from app.services.api_key_manager import APIKeyService
@@ -1918,6 +1919,7 @@ def create_api_key():
         key_name = data.get('key_name', 'Default')
         description = data.get('description', '')
         expires_days = data.get('expires_days', 365)
+        credential_id = data.get('credential_id')  # 新增：绑定的交易所配置ID
         
         # Validate input
         if not key_name or len(key_name) > 100:
@@ -1938,10 +1940,11 @@ def create_api_key():
             user_id=user_id,
             key_name=key_name,
             description=description,
-            expires_days=expires_days
+            expires_days=expires_days,
+            credential_id=credential_id  # 传入 credential_id
         )
         
-        logger.info(f"User {user_id} created new API key: {key_name}")
+        logger.info(f"User {user_id} created new API key: {key_name} (credential: {credential_id})")
         
         return jsonify({
             'code': 1,

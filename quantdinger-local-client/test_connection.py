@@ -1,105 +1,95 @@
 """
-WebSocket 连接测试脚本
-
-测试 WebSocket 连接，无需运行完整后端。
+Test WebSocket connection to cloud server
 """
-
 import asyncio
 import json
-from datetime import datetime, timezone
-
-try:
-    import websockets
-    print("✓ websockets 库已安装")
-except ImportError:
-    print("✗ websockets 库未安装")
-    print("请运行: pip install websockets")
-    exit(1)
-
+import websockets
 
 async def test_connection():
     """Test WebSocket connection."""
     
-    print("\n" + "="*60)
-    print("QuantDinger WebSocket 连接测试")
-    print("="*60)
+    # Configuration
+    api_key = "qd_test_key"  # Replace with your actual API key
+    cloud_url = "ws://39.105.150.99:8765/ws"
     
-    # Test configuration
-    api_key = "test-key-12345678"
-    cloud_url = "ws://localhost:8765/ws"
-    
-    print(f"\n配置信息:")
-    print(f"  API 密钥: {api_key}")
-    print(f"  云端地址: {cloud_url}")
-    print(f"\n正在尝试连接...")
+    print("=" * 80)
+    print("Testing WebSocket Connection to Cloud Server")
+    print("=" * 80)
+    print(f"Cloud URL: {cloud_url}")
+    print(f"API Key: {api_key[:8]}...")
+    print("=" * 80)
     
     try:
+        print("\n[1/3] Connecting to WebSocket...")
         async with websockets.connect(cloud_url) as websocket:
-            print("✓ 连接成功!")
+            print("[1/3] ✓ Connected!")
             
             # Send authentication
+            print("\n[2/3] Sending authentication...")
             auth_message = {
                 'api_key': api_key,
-                'client_type': 'test_client',
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'broker_account_id': 'test_account',  # Test account ID
             }
             await websocket.send(json.dumps(auth_message))
-            print("✓ 认证信息已发送")
+            print("[2/3] ✓ Authentication sent")
             
-            # 等待响应
-            print("\n等待服务器响应...")
-            response = await asyncio.wait_for(websocket.recv(), timeout=5)
-            data = json.loads(response)
-            
-            print(f"\n✓ 服务器响应:")
-            print(f"  类型: {data.get('type')}")
-            print(f"  客户端 ID: {data.get('client_id', 'N/A')}")
-            print(f"  消息: {data.get('message', 'N/A')}")
-            
-            if data.get('type') == 'connection_established':
-                print("\n🎉 测试通过! WebSocket 连接正常工作。")
-                return True
-            else:
-                print(f"\n⚠ 意外的响应类型: {data.get('type')}")
-                return False
+            # Wait for response (timeout 5 seconds)
+            print("\n[3/3] Waiting for response...")
+            try:
+                response = await asyncio.wait_for(websocket.recv(), timeout=5)
+                data = json.loads(response)
+                
+                print("[3/3] ✓ Response received!")
+                print(f"\nResponse type: {data.get('type', 'N/A')}")
+                
+                if data.get('type') == 'connection_established':
+                    print("\n✅ SUCCESS! Connection established successfully")
+                    print(f"Message: {data.get('message', 'N/A')}")
+                    
+                    user_info = data.get('user', {})
+                    if user_info:
+                        print(f"Username: {user_info.get('username', 'N/A')}")
+                        print(f"Email: {user_info.get('email', 'N/A')}")
+                    
+                    broker_validation = data.get('broker_validation', {})
+                    if broker_validation:
+                        print(f"\nBroker Validation:")
+                        print(f"  Valid: {broker_validation.get('valid', 'N/A')}")
+                        print(f"  Validated: {broker_validation.get('validated', 'N/A')}")
+                        print(f"  Expected Account: {broker_validation.get('expected_account', 'N/A')}")
+                        print(f"  Actual Account: {broker_validation.get('actual_account', 'N/A')}")
+                        
+                elif data.get('type') == 'error':
+                    print(f"\n❌ ERROR: {data.get('message', 'Unknown error')}")
+                else:
+                    print(f"\n⚠️  Unexpected response type: {data.get('type')}")
+                    print(f"Full response: {json.dumps(data, indent=2)}")
+                    
+            except asyncio.TimeoutError:
+                print("[3/3] ⚠️  Timeout waiting for response")
+                print("This might indicate:")
+                print("  - Invalid API key")
+                print("  - No active clients for this user")
+                print("  - Server is not responding")
     
-    except ConnectionRefusedError:
-        print("\n✗ 连接被拒绝")
-        print("\n可能原因:")
-        print("  1. WebSocket 服务器未启动")
-        print("  2. URL 或端口错误")
-        print("\n启动服务器:")
-        print("  cd backend_api_python")
-        print("  python start_websocket_server.py")
-        return False
-    
-    except asyncio.TimeoutError:
-        print("\n✗ 连接超时")
-        print("  服务器可能响应缓慢或无响应")
-        return False
-    
+    except websockets.exceptions.ConnectionClosed as e:
+        print(f"\n❌ Connection closed: {e}")
+        print("\nPossible reasons:")
+        print("  - Invalid API key (code 4001)")
+        print("  - Broker account mismatch (code 4002)")
+        print("  - Server rejected the connection")
+        
     except Exception as e:
-        print(f"\n✗ 错误: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-async def main():
-    """Main test function."""
-    result = await test_connection()
-    
-    print("\n" + "="*60)
-    if result:
-        print("结果: ✓ 通过")
-    else:
-        print("结果: ✗ 失败")
-    print("="*60 + "\n")
-    
-    return 0 if result else 1
-
+        print(f"\n❌ Error: {type(e).__name__}: {e}")
+        print("\nPossible reasons:")
+        print("  - Server is not running")
+        print("  - Network connectivity issue")
+        print("  - Wrong URL or port")
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    input("按回车键退出...")
-    exit(exit_code)
+    print("\n⚠️  IMPORTANT: Please replace 'qd_test_key' with your actual API key")
+    print("   You can get it from the Web UI: Settings → API Keys\n")
+    
+    input("Press Enter to continue with test (or Ctrl+C to cancel)...")
+    
+    asyncio.run(test_connection())

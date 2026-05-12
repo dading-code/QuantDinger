@@ -24,6 +24,7 @@ from app.data_sources.rate_limiter import (
     random_sleep,
     retry_with_backoff
 )
+from app.data_sources.errors import UnsupportedMarketError
 
 __all__ = [
     # 工厂
@@ -41,4 +42,6 @@ __all__ = [
     'get_random_user_agent',
     'random_sleep',
     'retry_with_backoff',
+    # 错误类
+    'UnsupportedMarketError',
 ]

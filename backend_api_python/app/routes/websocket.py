@@ -43,10 +43,10 @@ def get_client_status():
         
         # 获取WebSocket Hub实例
         try:
-            from app.services.websocket_signal import WebSocketSignalHub
-            hub = WebSocketSignalHub.get_instance()
+            from app.services.websocket_signal import get_signal_hub
+            hub = get_signal_hub()
         except Exception as e:
-            logger.warning(f"Failed to get WebSocketSignalHub instance: {e}")
+            logger.warning(f"Failed to get WebSocket signal hub: {e}")
             hub = None
         
         if not hub:
@@ -111,10 +111,10 @@ def is_client_connected():
         
         # 获取WebSocket Hub实例
         try:
-            from app.services.websocket_signal import WebSocketSignalHub
-            hub = WebSocketSignalHub.get_instance()
+            from app.services.websocket_signal import get_signal_hub
+            hub = get_signal_hub()
         except Exception as e:
-            logger.warning(f"Failed to get WebSocketSignalHub instance: {e}")
+            logger.warning(f"Failed to get WebSocket signal hub: {e}")
             hub = None
         
         if not hub:
@@ -190,10 +190,10 @@ def list_all_clients():
         
         # 获取WebSocket Hub实例
         try:
-            from app.services.websocket_signal import WebSocketSignalHub
-            hub = WebSocketSignalHub.get_instance()
+            from app.services.websocket_signal import get_signal_hub
+            hub = get_signal_hub()
         except Exception as e:
-            logger.warning(f"Failed to get WebSocketSignalHub instance: {e}")
+            logger.warning(f"Failed to get WebSocket signal hub: {e}")
             hub = None
         
         if not hub:

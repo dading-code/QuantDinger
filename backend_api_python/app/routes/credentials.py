@@ -182,6 +182,28 @@ def create_credential():
             mt5_password = (data.get('mt5_password') or '').strip()
             if not mt5_server or not mt5_login or not mt5_password:
                 return jsonify({'code': 0, 'msg': 'Missing mt5_server/mt5_login/mt5_password', 'data': None}), 400
+            
+            # 尝试验证 MT5 账号并获取实际 Login ID
+            expected_account_id = ''
+            try:
+                from app.services.live_trading.factory import create_mt5_client
+                client = create_mt5_client({
+                    'exchange_id': 'mt5',
+                    'mt5_login': mt5_login,
+                    'mt5_password': mt5_password,
+                    'mt5_server': mt5_server,
+                    'market_category': 'Forex'
+                })
+                account_info = client.get_account_info()
+                if account_info and 'login' in account_info:
+                    expected_account_id = str(account_info['login'])
+                    logger.info(f"MT5 credential verified. Expected Account ID: {expected_account_id}")
+                client.disconnect()
+            except Exception as e:
+                logger.warning(f"Failed to verify MT5 credentials during binding: {e}")
+                # 即使验证失败也允许保存，但会记录警告
+                expected_account_id = mt5_login
+
             config.update({
                 'mt5_server': mt5_server,
                 'mt5_login': mt5_login,

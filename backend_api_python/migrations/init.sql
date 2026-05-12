@@ -1122,6 +1122,7 @@ END $$;
 CREATE TABLE IF NOT EXISTS qd_api_keys (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    credential_id INTEGER REFERENCES qd_exchange_credentials(id) ON DELETE SET NULL, -- 绑定的交易所配置
     api_key TEXT NOT NULL UNIQUE,
     key_name VARCHAR(100) DEFAULT 'Default',
     description TEXT DEFAULT '',
