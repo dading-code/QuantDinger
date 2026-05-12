@@ -55,18 +55,26 @@ def _api_key_hint(api_key: str) -> str:
 @credentials_bp.route('/list', methods=['GET'])
 @login_required
 def list_credentials():
-    """List all credentials for the current user."""
+    """List all credentials for the current user with associated API Keys."""
     try:
         user_id = g.user_id
 
         with get_db_connection() as db:
             cur = db.cursor()
+            # 关联查询API Key信息（只取最新的一个active API Key）
             cur.execute(
                 """
-                SELECT id, user_id, name, exchange_id, api_key_hint, encrypted_config, created_at, updated_at
-                FROM qd_exchange_credentials
-                WHERE user_id = %s
-                ORDER BY id DESC
+                SELECT ec.id, ec.user_id, ec.name, ec.exchange_id, ec.api_key_hint, 
+                       ec.encrypted_config, ec.created_at, ec.updated_at,
+                       ak.api_key as api_key_value, ak.key_name as api_key_name
+                FROM qd_exchange_credentials ec
+                LEFT JOIN qd_api_keys ak ON ak.id = (
+                    SELECT id FROM qd_api_keys 
+                    WHERE credential_id = ec.id AND active = true 
+                    ORDER BY id DESC LIMIT 1
+                )
+                WHERE ec.user_id = %s
+                ORDER BY ec.id DESC
                 """,
                 (user_id,)
             )
@@ -84,6 +92,20 @@ def list_credentials():
             except Exception:
                 item['enable_demo_trading'] = False
             item.pop('encrypted_config', None)
+            
+            # 脱敏处理API Key（只显示前8位和后4位）
+            api_key_value = item.pop('api_key_value', None)
+            if api_key_value:
+                if len(api_key_value) > 12:
+                    item['api_key'] = api_key_value[:8] + '...' + api_key_value[-4:]
+                    item['api_key_full'] = api_key_value  # 完整Key用于复制
+                else:
+                    item['api_key'] = api_key_value
+                    item['api_key_full'] = api_key_value
+            else:
+                item['api_key'] = None
+                item['api_key_full'] = None
+            
             items.append(item)
 
         return jsonify({'code': 1, 'msg': 'success', 'data': {'items': items}})
