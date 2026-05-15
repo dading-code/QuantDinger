@@ -13,7 +13,7 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     import websockets
@@ -39,7 +39,7 @@ async def test_connection(api_key: str, url: str):
             auth_message = {
                 "api_key": api_key,
                 "client_type": "test_client",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             await websocket.send(json.dumps(auth_message))
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Authentication sent")
@@ -49,7 +49,7 @@ async def test_connection(api_key: str, url: str):
             data = json.loads(response)
             
             if data.get('type') == 'connection_established':
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ Connected successfully!")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Connected successfully!")
                 print(f"  Client ID: {data.get('client_id')}")
                 print(f"\nListening for trading signals...\n{'='*80}\n")
                 
@@ -65,7 +65,7 @@ async def test_connection(api_key: str, url: str):
                     
                     if data.get('type') == 'trading_signal':
                         signal = data.get('data', {})
-                        print(f"\n📊 Trading Signal Details:")
+                        print(f"\nTrading Signal Details:")
                         print(f"  Strategy: {signal.get('strategy_name', 'N/A')}")
                         print(f"  Symbol: {signal.get('symbol', 'N/A')}")
                         print(f"  Type: {signal.get('signal_type', 'N/A')}")
@@ -79,9 +79,9 @@ async def test_connection(api_key: str, url: str):
                         if notif_results:
                             print(f"\n  Notification Results:")
                             for channel, result in notif_results.items():
-                                status = "✓" if result.get('ok') else "✗"
+                                status = "OK" if result.get('ok') else "FAIL"
                                 error = f" ({result.get('error', '')})" if not result.get('ok') else ""
-                                print(f"    {status} {channel}{error}")
+                                print(f"    [{status}] {channel}{error}")
                     
                     elif data.get('type') == 'pong':
                         print(f"  Heartbeat received")

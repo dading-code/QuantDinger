@@ -1,0 +1,11 @@
+[
+  {
+    "id": "shutdown-1778600176478",
+    "from": "team-lead",
+    "to": "review-trading",
+    "type": "shutdown_request",
+    "content": "{\"type\":\"shutdown_request\",\"request_id\":\"shutdown-1778600176478\",\"reason\":\"审查已完成，感谢你的贡献，请关闭。\",\"from\":\"team-lead\",\"timestamp\":\"2026-05-12T15:36:16.478Z\"}",
+    "timestamp": "2026-05-12T15:36:16.478Z",
+    "read": false
+  }
+]

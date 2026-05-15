@@ -1,0 +1,28 @@
+{
+  "name": "_auto_786195a74b4346ebad381ec334055384",
+  "leadAgentId": "786195a74b4346ebad381ec334055384",
+  "workspacePath": "d:\\www\\workai\\QuantDinger",
+  "createdAt": "2026-05-12T15:23:34.454Z",
+  "options": {
+    "workspacePath": "d:\\www\\workai\\QuantDinger",
+    "isAutoTeam": true
+  },
+  "members": [
+    {
+      "memberId": "team-lead@_auto_786195a74b4346ebad381ec334055384",
+      "name": "team-lead",
+      "role": "Team Lead - coordinates the team and interacts with the user"
+    },
+    {
+      "memberId": "review-security@_auto_786195a74b4346ebad381ec334055384",
+      "name": "review-security",
+      "role": "审查安全模块"
+    },
+    {
+      "memberId": "collect-results@_auto_786195a74b4346ebad381ec334055384",
+      "name": "collect-results",
+      "role": "收集审查结果"
+    }
+  ],
+  "isAutoTeam": true
+}

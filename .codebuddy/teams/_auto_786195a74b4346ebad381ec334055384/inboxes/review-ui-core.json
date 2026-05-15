@@ -1,0 +1,29 @@
+[
+  {
+    "id": "msg-1778599514224-nazqxh",
+    "from": "team-lead",
+    "to": "@team",
+    "type": "broadcast",
+    "content": "代码审查任务已启动，请执行审查并返回报告",
+    "timestamp": "2026-05-12T15:25:14.224Z",
+    "read": true
+  },
+  {
+    "id": "msg-1778599605570-zsmsw5",
+    "from": "team-lead",
+    "to": "@team",
+    "type": "broadcast",
+    "content": "审查任务执行中",
+    "timestamp": "2026-05-12T15:26:45.570Z",
+    "read": true
+  },
+  {
+    "id": "shutdown-1778600162086",
+    "from": "team-lead",
+    "to": "review-ui-core",
+    "type": "shutdown_request",
+    "content": "{\"type\":\"shutdown_request\",\"request_id\":\"shutdown-1778600162086\",\"reason\":\"审查已完成，感谢你的贡献，请关闭。\",\"from\":\"team-lead\",\"timestamp\":\"2026-05-12T15:36:02.086Z\"}",
+    "timestamp": "2026-05-12T15:36:02.086Z",
+    "read": true
+  }
+]

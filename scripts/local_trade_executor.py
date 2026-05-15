@@ -42,6 +42,12 @@ except ImportError:
     print("Install with: pip install websockets")
     sys.exit(1)
 
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+
 
 class LocalTradeExecutor:
     """
@@ -458,8 +464,10 @@ class LocalTradeExecutor:
         - If HTTP request fails, retry up to max_retries times with exponential backoff
         - Prevents infinite loops by limiting retries
         """
-        import aiohttp
-        
+        if not AIOHTTP_AVAILABLE:
+            print(f"[Report] aiohttp not installed, cannot report execution result")
+            return False
+
         report_data = {
             'api_key': self.api_key,
             'pending_order_id': pending_order_id,
@@ -507,9 +515,28 @@ class LocalTradeExecutor:
         if self.broker_type == 'simulation':
             print(f"[Broker] Using simulation mode")
         elif self.broker_type == 'mt5':
-            print(f"[Broker] MT5 will be initialized on first trade")
+            try:
+                import MetaTrader5 as mt5
+                if mt5.initialize():
+                    self.broker_client = mt5
+                    print(f"[Broker] MT5 initialized successfully")
+                else:
+                    error = mt5.last_error()
+                    print(f"[Broker] MT5 initialization failed: {error}")
+                    print(f"[Broker] Will retry on first trade")
+            except ImportError:
+                print(f"[Broker] MetaTrader5 not installed, will try on first trade")
         elif self.broker_type == 'ibkr':
-            print(f"[Broker] IBKR integration pending")
+            try:
+                from ib_insync import IB
+                self.broker_client = IB()
+                self.broker_client.connect('127.0.0.1', 7497, clientId=1)
+                print(f"[Broker] IBKR connected successfully")
+            except ImportError:
+                print(f"[Broker] ib_insync not installed, will try on first trade")
+            except Exception as e:
+                print(f"[Broker] IBKR connection failed: {e}")
+                print(f"[Broker] Will retry on first trade")
         else:
             print(f"[Broker] Unknown broker type: {self.broker_type}")
 

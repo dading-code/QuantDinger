@@ -61,18 +61,14 @@ def list_credentials():
 
         with get_db_connection() as db:
             cur = db.cursor()
-            # 关联查询API Key信息（只取最新的一个active API Key）
+            # 关联查询API Key信息
             cur.execute(
                 """
                 SELECT ec.id, ec.user_id, ec.name, ec.exchange_id, ec.api_key_hint, 
                        ec.encrypted_config, ec.created_at, ec.updated_at,
                        ak.api_key as api_key_value, ak.key_name as api_key_name
                 FROM qd_exchange_credentials ec
-                LEFT JOIN qd_api_keys ak ON ak.id = (
-                    SELECT id FROM qd_api_keys 
-                    WHERE credential_id = ec.id AND active = true 
-                    ORDER BY id DESC LIMIT 1
-                )
+                LEFT JOIN qd_api_keys ak ON ec.id = ak.credential_id AND ak.active = true
                 WHERE ec.user_id = %s
                 ORDER BY ec.id DESC
                 """,

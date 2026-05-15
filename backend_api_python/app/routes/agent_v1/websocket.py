@@ -2,11 +2,17 @@
 WebSocket Signal API Routes for Flask
 
 Integrates WebSocket signal broadcasting into the existing Agent Gateway API.
-Note: Flask doesn't natively support WebSockets. We use a separate async server.
+The actual WebSocket endpoint is served by a separate asyncio server on port 8765
+(see start_websocket_server.py). These HTTP routes provide hub stats and testing.
+
+Architecture:
+  - ws://host:8765/ws                    asyncio WebSocket server (real-time signals)
+  - /api/agent/v1/ws/stats               Flask HTTP (hub statistics)
+  - /api/agent/v1/ws/broadcast/test      Flask HTTP (test broadcast)
 """
 
 from flask import Blueprint, jsonify, request
-from app.services.websocket_signal import get_signal_hub
+from app.services.websocket_signal import get_signal_hub, get_background_loop
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,12 +67,10 @@ def test_broadcast():
             "test_mode": True,
         }
         
-        # Run async broadcast in sync context
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(hub.broadcast_signal(test_signal))
-        finally:
-            loop.close()
+        asyncio.run_coroutine_threadsafe(
+            hub.broadcast_signal(test_signal),
+            get_background_loop()
+        )
         
         return jsonify({
             "success": True,

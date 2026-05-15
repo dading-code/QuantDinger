@@ -771,12 +771,20 @@ class PendingOrderWorker:
 
             # Broadcast signal via WebSocket to local trade executors
             try:
-                from app.services.websocket_signal import get_signal_hub
+                from app.services.websocket_signal import get_signal_hub, get_background_loop
                 hub = get_signal_hub()
-                
-                # Prepare WebSocket signal payload
+
+                sid = int(strategy_id or 0)
+                ws_user_id = None
+                if sid > 0:
+                    try:
+                        sc = load_strategy_configs(sid)
+                        ws_user_id = int(sc.get("user_id") or 1)
+                    except Exception:
+                        pass
+
                 ws_signal = {
-                    "strategy_id": int(strategy_id or 0),
+                    "strategy_id": sid,
                     "strategy_name": str(strategy_name or ""),
                     "symbol": str(symbol or ""),
                     "signal_type": str(signal_type or ""),
@@ -791,15 +799,13 @@ class PendingOrderWorker:
                         for c, r in results.items()
                     },
                 }
-                
-                # Async broadcast (non-blocking)
+
                 asyncio.run_coroutine_threadsafe(
-                    hub.broadcast_signal(ws_signal),
-                    asyncio.new_event_loop()
+                    hub.broadcast_signal(ws_signal, target_user_id=ws_user_id),
+                    get_background_loop()
                 )
                 logger.debug(f"Signal broadcasted via WebSocket: {signal_type} {symbol}")
             except Exception as ws_error:
-                # Don't fail the notification if WebSocket broadcast fails
                 logger.warning(f"WebSocket broadcast failed (non-critical): {ws_error}")
 
             attempted = list(results.keys())
@@ -934,8 +940,9 @@ class PendingOrderWorker:
         
         for attempt in range(1, MAX_RETRY + 1):
             try:
-                from app.services.websocket_signal import get_signal_hub
+                from app.services.websocket_signal import get_signal_hub, get_background_loop
                 hub = get_signal_hub()
+                bg_loop = get_background_loop()
                 
                 # Check if there are any connected clients for this user
                 active_clients = sum(
@@ -956,8 +963,11 @@ class PendingOrderWorker:
                         time.sleep(wait_time)
                     continue
                 
-                # Broadcast signal to user's clients
-                asyncio.run(hub.broadcast_signal(signal_data, target_user_id=user_id))
+                # Broadcast signal to user's clients via background loop
+                asyncio.run_coroutine_threadsafe(
+                    hub.broadcast_signal(signal_data, target_user_id=user_id),
+                    bg_loop
+                )
                 
                 success = True
                 logger.info(
