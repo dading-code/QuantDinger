@@ -211,20 +211,54 @@ def safe_exec_with_validation(
     timeout: int = 60,
     max_memory_mb: Optional[int] = None,
     pre_import: str = "import numpy as np\nimport pandas as pd\n",
+    use_isolated: bool = True,
 ) -> Dict[str, Any]:
     """
     Validate + execute user code in one call.
 
     1. Runs validate_code_safety(); rejects unsafe code.
-    2. Injects build_safe_builtins() if __builtins__ is not already set.
-    3. Executes pre_import, then user code via safe_exec_code().
+    2. If use_isolated=True (default), executes in a subprocess via safe_exec_isolated().
+    3. Otherwise executes in current process via safe_exec_code().
 
-    Returns same dict as safe_exec_code().
+    Args:
+        use_isolated: 默认 True，优先使用安全的子进程隔离执行
+
+    Returns dict with 'success', 'error', 'result'
     """
     is_safe, err = validate_code_safety(code)
     if not is_safe:
         return {'success': False, 'error': f"Unsafe code rejected: {err}", 'result': None}
 
+    if use_isolated:
+        # 优先使用子进程隔离执行
+        # 提取需要传递给子进程的数据
+        input_data = {}
+        for k, v in exec_globals.items():
+            if k.startswith('_') or k in ('np', 'pd', '__builtins__'):
+                continue
+            try:
+                import pickle
+                pickle.dumps(v)
+                input_data[k] = v
+            except Exception:
+                pass
+
+        # 组合代码
+        full_code = pre_import + "\n" + code if pre_import else code
+        result = safe_exec_isolated(
+            code=full_code,
+            input_data=input_data,
+            timeout=timeout,
+            max_memory_mb=max_memory_mb or 500,
+        )
+
+        if result['success'] and result['result']:
+            # 将结果同步回原 exec_globals
+            exec_globals.update(result['result'])
+
+        return result
+
+    # 回退到非隔离执行
     if '__builtins__' not in exec_globals:
         exec_globals['__builtins__'] = build_safe_builtins()
 

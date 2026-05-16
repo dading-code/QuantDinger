@@ -184,26 +184,52 @@ class LLMService:
     def _call_openai_compatible(self, messages: list, model: str, temperature: float, 
                                  api_key: str, base_url: str, timeout: int,
                                  use_json_mode: bool = True) -> str:
-        """Call OpenAI-compatible API (OpenAI, DeepSeek, Grok, OpenRouter)."""
-        url = f"{base_url}/chat/completions"
+        """Call OpenAI-compatible API (OpenAI, DeepSeek, Grok, OpenRouter, AnythingLLM)."""
+        if "/chat/completions" in base_url:
+            url = base_url
+        elif "/workspace/" in base_url:
+            url = base_url
+        else:
+            url = f"{base_url}/chat/completions"
         
         headers = {"Content-Type": "application/json"}
+        
         if (api_key or "").strip():
             headers["Authorization"] = f"Bearer {api_key.strip()}"
+        
+        logger.debug(f"LLM request URL: {url}")
+        logger.debug(f"LLM request headers: {headers}")
         
         # OpenRouter specific headers
         if "openrouter" in base_url:
             headers["HTTP-Referer"] = "https://quantdinger.com"
             headers["X-Title"] = "QuantDinger Analysis"
 
-        data = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        
-        if use_json_mode:
-            data["response_format"] = {"type": "json_object"}
+        # AnythingLLM workspace endpoint uses different format
+        if "/workspace/" in base_url:
+            # AnythingLLM format: {"message": "...", "mode": "query"}
+            user_message = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    user_message = msg.get("content", "")
+                    break
+            if not user_message and messages:
+                user_message = messages[-1].get("content", "")
+            
+            data = {
+                "message": user_message,
+                "mode": "query"
+            }
+        else:
+            # Standard OpenAI-compatible format
+            data = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            
+            if use_json_mode:
+                data["response_format"] = {"type": "json_object"}
 
         response = requests.post(url, headers=headers, json=data, timeout=timeout)
         
@@ -238,6 +264,18 @@ class LLMService:
             raise ValueError(error_msg)
         
         result = response.json()
+        
+        # Handle AnythingLLM response format
+        if "/workspace/" in base_url:
+            if "textResponse" in result:
+                content = result.get("textResponse", "")
+                if not content:
+                    raise ValueError(f"Model returned empty content")
+                return content
+            else:
+                raise ValueError(f"AnythingLLM response missing 'textResponse': {result}")
+        
+        # Standard OpenAI-compatible format
         if "choices" in result and len(result["choices"]) > 0:
             content = result["choices"][0]["message"]["content"]
             if not content:
@@ -578,6 +616,10 @@ class LLMService:
             
             # Strip markdown fences if present
             clean_text = response_text.strip()
+            
+            # Remove <think> tags (common in some LLM outputs)
+            clean_text = clean_text.replace("<think>", "").replace("</think>", "")
+            
             if clean_text.startswith("```"):
                 first_newline = clean_text.find("\n")
                 if first_newline != -1:

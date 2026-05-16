@@ -76,11 +76,15 @@ def get_pending_order_worker():
 
 def start_polymarket_worker():
     """启动Polymarket后台任务"""
-    try:
-        from app.services.polymarket_worker import get_polymarket_worker
-        get_polymarket_worker().start()
-    except Exception as e:
-        logger.error(f"Failed to start Polymarket worker: {e}")
+    import os
+    if os.getenv('POLYMARKET_ENABLED', 'false').lower() == 'true':
+        try:
+            from app.services.polymarket_worker import get_polymarket_worker
+            get_polymarket_worker().start()
+        except Exception as e:
+            logger.error(f"Failed to start Polymarket worker: {e}")
+    else:
+        logger.info("Polymarket worker disabled (POLYMARKET_ENABLED=false)")
 
 
 def start_portfolio_monitor():

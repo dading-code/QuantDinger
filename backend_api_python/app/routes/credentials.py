@@ -94,13 +94,12 @@ def list_credentials():
             if api_key_value:
                 if len(api_key_value) > 12:
                     item['api_key'] = api_key_value[:8] + '...' + api_key_value[-4:]
-                    item['api_key_full'] = api_key_value  # 完整Key用于复制
                 else:
                     item['api_key'] = api_key_value
-                    item['api_key_full'] = api_key_value
+                # 安全最佳实践：不向客户端返回完整 API 密钥
+                # 如果需要复制功能，应使用单独的带二次验证的端点
             else:
                 item['api_key'] = None
-                item['api_key_full'] = None
             
             items.append(item)
 
