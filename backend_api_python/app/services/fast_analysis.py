@@ -756,7 +756,21 @@ IMPORTANT:
 3. Pay attention to BREAKING NEWS and international events that could cause sudden market moves. Geopolitical tensions (e.g., US-Iran conflict) can cause severe market volatility.
 4. For Crypto, explicitly explain whether derivatives + capital flow data confirm or contradict price action. For US stocks, analyze financial statements and earnings trends to assess company health.
 5. If you see news about wars, conflicts, or major geopolitical events, you MUST mention them in your analysis and adjust your recommendation accordingly.
-6. Provide your analysis now. Remember: all prices must be within 10% of ${current_price}."""
+6. Provide your analysis now. Remember: all prices must be within 10% of ${current_price}.
+
+OUTPUT FORMAT REQUIREMENT (MANDATORY):
+You MUST return ONLY a valid JSON object with the following structure:
+{{
+    "decision": "BUY" or "SELL" or "HOLD",
+    "confidence": number between 0-100,
+    "summary": "Your detailed analysis summary in Chinese",
+    "key_reasons": ["Reason 1", "Reason 2", "Reason 3"],
+    "risks": ["Risk 1", "Risk 2"],
+    "entry_price": number (close to current price),
+    "stop_loss": number,
+    "take_profit": number
+}}
+DO NOT include any other text, thinking, or markdown. ONLY return the JSON object."""
 
         return system_prompt, user_prompt
     

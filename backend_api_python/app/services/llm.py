@@ -207,7 +207,7 @@ class LLMService:
 
         # AnythingLLM workspace endpoint uses different format
         if "/workspace/" in base_url:
-            # AnythingLLM format: {"message": "...", "mode": "query"}
+            # AnythingLLM format: {"message": "...", "mode": "query", "threadSlug": "..."}
             user_message = ""
             for msg in messages:
                 if msg.get("role") == "user":
@@ -216,9 +216,14 @@ class LLMService:
             if not user_message and messages:
                 user_message = messages[-1].get("content", "")
             
+            # 🔴 [关键修复] AnythingLLM 需要 threadSlug 参数来隔离并发请求
+            import uuid
+            thread_slug = f"req_{uuid.uuid4().hex[:16]}"
+            
             data = {
                 "message": user_message,
-                "mode": "query"
+                "mode": "query",
+                "threadSlug": thread_slug
             }
         else:
             # Standard OpenAI-compatible format
@@ -641,6 +646,24 @@ class LLMService:
                     end = response_text.rfind('}') + 1
                     if start >= 0 and end > start:
                         result = json.loads(response_text[start:end])
+                        return result
+            except:
+                pass
+            
+            # 🔴 [修复] 如果 LLM 返回的不是 JSON，而是纯文本，尝试提取分析内容
+            try:
+                if response_text:
+                    # 移除 <think> 标签
+                    clean_text = response_text.replace("<think>", "").replace("</think>", "").strip()
+                    logger.info(f"[LLM Fallback] Cleaned text length: {len(clean_text)}, preview: {clean_text[:200]}")
+                    # 如果文本看起来像分析内容，将其放入 summary 和其他字段
+                    if len(clean_text) > 50:
+                        # 使用默认结构但填充文本内容
+                        result = default_structure.copy()
+                        result['summary'] = clean_text[:500] if len(clean_text) > 500 else clean_text
+                        result['key_reasons'] = ["Analysis completed", "LLM returned text response"]
+                        result['risks'] = ["Data format warning: LLM did not return JSON format"]
+                        logger.info(f"[LLM Fallback] Returning text summary, length: {len(result['summary'])}")
                         return result
             except:
                 pass
