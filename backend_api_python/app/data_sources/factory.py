@@ -87,6 +87,16 @@ class DataSourceFactory:
     @classmethod
     def _create_source(cls, market: str) -> BaseDataSource:
         """创建数据源实例"""
+        import os
+        
+        # 本地 MT5 Observer（WebSocket MCP 拉取）。开启后 Forex/Crypto/Futures 优先走 Observer。
+        # 与远程 Server HTTP API 无关；数据由 QuantDinger 主动 mcp_request 拉取。
+        enable_mt5_observer = os.getenv('ENABLE_MT5_BRIDGE', 'false').lower() == 'true'
+        if enable_mt5_observer and market in ('Crypto', 'Forex', 'Futures'):
+            from app.data_sources.mt5_bridge import MT5BridgeDataSource
+            logger.info("Using MT5 Observer WebSocket MCP for %s market", market)
+            return MT5BridgeDataSource()
+        
         if market == 'Crypto':
             from app.data_sources.crypto import CryptoDataSource
             return CryptoDataSource()
@@ -110,6 +120,7 @@ class DataSourceFactory:
             return MOEXDataSource()
         elif market == 'MT5':
             from app.data_sources.mt5_bridge import MT5BridgeDataSource
+            logger.info("Using MT5 Observer WebSocket MCP for MT5 market")
             return MT5BridgeDataSource()
         else:
             raise ValueError(f"不支持的市场类型: {market}")

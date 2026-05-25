@@ -22,6 +22,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -76,13 +77,22 @@ def market_overview():
             "timestamp": int(time.time()),
         }
 
+        # Check if crypto data should be skipped (to avoid Binance API timeout)
+        skip_crypto = os.getenv('SKIP_CRYPTO_DATA', 'false').lower() == 'true'
+        
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
                 executor.submit(fetch_stock_indices): "indices",
                 executor.submit(fetch_forex_pairs): "forex",
-                executor.submit(fetch_crypto_prices): "crypto",
                 executor.submit(fetch_commodities): "commodities",
             }
+            # Only fetch crypto if not skipped
+            if not skip_crypto:
+                futures[executor.submit(fetch_crypto_prices)] = "crypto"
+            else:
+                logger.info("Skipping crypto data fetch (SKIP_CRYPTO_DATA=true)")
+                result["crypto"] = []
+                
             for future in as_completed(futures):
                 key = futures[future]
                 try:

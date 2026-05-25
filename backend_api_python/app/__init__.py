@@ -229,6 +229,12 @@ def create_app(config_name='default'):
 
     app.config['JSON_AS_ASCII'] = False
     
+    # Enable detailed error traces in debug mode
+    from app.config.settings import Config
+    if Config.DEBUG:
+        app.config['PROPAGATE_EXCEPTIONS'] = True
+        app.config['TRAP_HTTP_EXCEPTIONS'] = True
+    
     CORS(app)
     
     setup_logger()

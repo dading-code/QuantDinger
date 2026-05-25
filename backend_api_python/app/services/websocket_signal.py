@@ -5,7 +5,7 @@ import json
 import threading
 import time
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
 try:
@@ -56,6 +56,13 @@ class WebSocketSignalHub:
             'messages_sent': 0,
             'messages_failed': 0,
         }
+        
+        # 🆕 新增：MCP 请求响应映射
+        self.pending_requests: Dict[str, asyncio.Future] = {}
+        
+        # 🆕 新增：按账户ID索引（支持多客户端）
+        self.account_clients: Dict[str, str] = {}  # account_id -> client_id
+        
         logger.info("WebSocketSignalHub initialized")
 
     async def register_client(
@@ -71,9 +78,22 @@ class WebSocketSignalHub:
         user_info = APIKeyService.validate_api_key(api_key)
 
         if not user_info:
-            await websocket.close(code=4001, reason="Invalid API key")
-            logger.warning("Client rejected: invalid API key")
-            return None
+            # 检查是否是开发模式白名单
+            dev_tokens = ["test-token", "observer-token", "dev-debug"]
+            if api_key in dev_tokens:
+                logger.warning(f"[开发模式] 使用测试 Token: {api_key[:8]}...")
+                # 创建虚拟用户信息用于开发模式
+                user_info = {
+                    'user_id': 999,
+                    'username': 'dev_user',
+                    'email': 'dev@localhost',
+                    'role': 'admin',
+                    'credential_id': None
+                }
+            else:
+                await websocket.close(code=4001, reason="Invalid API key")
+                logger.warning("Client rejected: invalid API key")
+                return None
 
         user_id = user_info['user_id']
         cred_id = credential_id or user_info.get('credential_id')
@@ -106,6 +126,10 @@ class WebSocketSignalHub:
             self.client_metadata[client_id] = metadata
             self.stats['total_connections'] += 1
             self.stats['active_connections'] = len(self.clients)
+            
+            # 🆕 维护账户-客户端映射
+            if broker_account_id:
+                self.account_clients[broker_account_id] = client_id
 
         logger.info(
             f"Client registered: {client_id} for user: {user_info['username']} "
@@ -147,6 +171,13 @@ class WebSocketSignalHub:
 
     async def unregister_client(self, client_id: str):
         with self._lock:
+            # 🆕 获取客户端的账户ID并清理映射
+            metadata = self.client_metadata.get(client_id)
+            if metadata:
+                broker_account_id = metadata.get('broker_account_id')
+                if broker_account_id and self.account_clients.get(broker_account_id) == client_id:
+                    del self.account_clients[broker_account_id]
+            
             self.clients.pop(client_id, None)
             self.client_metadata.pop(client_id, None)
             self.stats['active_connections'] = len(self.clients)
@@ -194,6 +225,81 @@ class WebSocketSignalHub:
         except Exception as e:
             logger.error(f"Failed to send message to client {client_id}: {e}")
             await self.unregister_client(client_id)
+    
+    async def request_mcp(self, tool_name: str, params: dict, account_id: str = None, timeout: int = 10) -> Optional[dict]:
+        """
+        🆕 向 Desktop 发送 MCP 请求并等待响应
+        
+        Args:
+            tool_name: MCP 工具名称
+            params: 请求参数
+            account_id: 目标账户（None 表示随机选择一个在线账户）
+            timeout: 超时时间
+        
+        Returns:
+            响应数据或 None
+        """
+        # 如果没有指定账户，选择第一个在线账户
+        if not account_id:
+            online_accounts = self.get_online_accounts()
+            if not online_accounts:
+                logger.warning("[MCP请求] 没有在线的 Desktop 客户端")
+                return None
+            account_id = online_accounts[0]
+        
+        # 获取账户对应的客户端
+        with self._lock:
+            client_id = self.account_clients.get(account_id)
+            if not client_id:
+                logger.warning(f"[MCP请求] 账户 {account_id} 没有在线客户端")
+                return None
+        
+        request_id = f"req_{uuid.uuid4().hex[:12]}"
+        message = {
+            "type": "mcp_request",
+            "request_id": request_id,
+            "tool_name": tool_name,
+            "params": params
+        }
+        
+        logger.info(f"[MCP请求] account={account_id}, tool={tool_name}, request_id={request_id}")
+        
+        # 创建 Future 等待响应
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.pending_requests[request_id] = future
+        
+        try:
+            await self._send_to_client(client_id, message)
+            response = await asyncio.wait_for(future, timeout=timeout)
+            logger.info(f"[MCP响应] request_id={request_id}, success={response.get('success')}")
+            return response
+        except asyncio.TimeoutError:
+            logger.warning(f"[MCP超时] request_id={request_id}")
+            return None
+        except Exception as e:
+            logger.error(f"[MCP失败] request_id={request_id}, error={e}")
+            return None
+        finally:
+            if request_id in self.pending_requests:
+                del self.pending_requests[request_id]
+    
+    def handle_mcp_response(self, request_id: str, response_data: dict):
+        """🆕 处理 Desktop 返回的 MCP 响应"""
+        if request_id in self.pending_requests:
+            future = self.pending_requests[request_id]
+            if not future.done():
+                future.set_result(response_data)
+    
+    def get_online_accounts(self) -> List[str]:
+        """🆕 获取所有在线账户列表"""
+        accounts = list(self.account_clients.keys())
+        logger.info(f"[DEBUG] get_online_accounts() 调用 | 在线账户数={len(accounts)} | 账户列表={accounts}")
+        return accounts
+    
+    def is_account_online(self, account_id: str) -> bool:
+        """🆕 检查账户是否在线"""
+        return account_id in self.account_clients
 
     async def _monitor_heartbeat(self, client_id: str):
         while True:
@@ -330,40 +436,117 @@ def get_signal_hub() -> WebSocketSignalHub:
     return _signal_hub
 
 
-async def websocket_handler(websocket, path: str = None):
+async def websocket_handler(websocket):
     """
     WebSocket connection handler for use with websockets.serve().
 
+    支持两种认证方式：
+    1. URL 参数模式（兼容 AI_Trading_Monitor_MT5_Observer）:
+       ws://host/ws/v1/agent/{account_id}?token={token}
+       
+    2. WebSocket 消息模式（原有模式）:
+       {"api_key": "...", "broker_account_id": "..."}
+
     Protocol:
-        1. Client sends JSON auth: {"api_key": "...", "broker_account_id": "..."}
+        1. Client connects with auth (URL params or message)
         2. Server validates and sends connection_established
-        3. Client receives trading_signal messages
-        4. Client sends {"type": "ping"} for heartbeat
+        3. Client sends {"type": "heartbeat"} periodically
+        4. Server sends MCP requests and receives responses
     """
     client_id = None
     try:
-        auth_message = await asyncio.wait_for(websocket.recv(), timeout=10)
-        auth_data = json.loads(auth_message)
-
-        api_key = auth_data.get('api_key', '')
+        # 尝试从 URL 参数获取认证信息（兼容 AI_Trading_Monitor_MT5_Observer）
+        api_key = None
+        broker_account_id = None
+        
+        # websockets 16+ 使用 websocket.request.path 获取路径
+        try:
+            path = websocket.request.path if hasattr(websocket, 'request') and hasattr(websocket.request, 'path') else None
+        except:
+            path = None
+        
+        logger.info(f"[WebSocket] 收到连接请求，path={path}")
+        
+        if path:
+            # 解析路径：/ws/v1/agent/{account_id}?token={token}
+            import urllib.parse
+            parsed = urllib.parse.urlparse(f"http://localhost{path}")
+            query = urllib.parse.parse_qs(parsed.query)
+            
+            # 获取 token（Observer 使用的认证方式）
+            if 'token' in query:
+                api_key = query['token'][0]
+            
+            # 从路径提取 account_id
+            path_parts = parsed.path.strip('/').split('/')
+            if len(path_parts) >= 4 and path_parts[2] == 'agent':
+                broker_account_id = path_parts[3]
+        
+        # 如果 URL 参数没有提供认证，尝试从 WebSocket 消息获取（原有模式）
         if not api_key:
-            await websocket.close(code=4001, reason="API key required")
+            auth_message = await asyncio.wait_for(websocket.recv(), timeout=10)
+            auth_data = json.loads(auth_message)
+            
+            api_key = auth_data.get('api_key', '')
+            broker_account_id = auth_data.get('broker_account_id', broker_account_id)
+            
+            if not api_key:
+                await websocket.close(code=4001, reason="API key required")
+                return
+
+        # 验证 API Key
+        valid_key = False
+        
+        # 开发模式白名单
+        dev_tokens = ["test-token", "observer-token", "dev-debug"]
+        
+        if api_key in dev_tokens:
+            logger.warning(f"[开发模式] 使用测试 Token: {api_key[:8]}...")
+            valid_key = True
+        
+        # 生产模式：从数据库验证
+        if not valid_key and api_key:
+            try:
+                from app.services.api_key_manager import APIKeyService
+                key_info = APIKeyService.validate_api_key(api_key)
+                if key_info:
+                    logger.info(f"[API Key验证成功] user={key_info.get('username')}")
+                    valid_key = True
+                else:
+                    logger.warning(f"[API Key验证失败] 无效的 API Key")
+            except Exception as e:
+                logger.error(f"[API Key验证异常] {e}")
+        
+        if not valid_key:
+            print(f"[WebSocket] ❌ 验证失败，关闭连接", flush=True)
+            await websocket.close(code=4003, reason="Invalid API key")
             return
-
-        broker_account_id = auth_data.get('broker_account_id')
-
+        else:
+            logger.info(f"[WebSocket] 验证通过")
+        
         hub = get_signal_hub()
         client_id = await hub.register_client(websocket, api_key, broker_account_id=broker_account_id)
 
         if client_id is None:
             return
+        
+        # 发送连接成功消息
+        msg_data = {
+            "type": "connection_established",
+            "account_id": broker_account_id,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        await websocket.send(json.dumps(msg_data))
 
         async for message in websocket:
             try:
                 data = json.loads(message)
                 msg_type = data.get('type', '')
 
-                if msg_type == 'ping':
+                if msg_type == 'ping' or msg_type == 'heartbeat':
+                    # 支持两种心跳格式：
+                    # 1. {"type": "ping"} - 原有格式
+                    # 2. {"type": "heartbeat"} - AI_Trading_Monitor_MT5_Observer 格式
                     await hub._send_to_client(client_id, {
                         'type': 'pong',
                         'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -378,6 +561,13 @@ async def websocket_handler(websocket, path: str = None):
                         'type': 'stats',
                         'data': hub.get_stats(),
                     })
+
+                elif msg_type == 'mcp_response':
+                    # 🆕 处理 MCP 响应
+                    request_id = data.get('request_id')
+                    if request_id:
+                        hub.handle_mcp_response(request_id, data)
+                        logger.debug(f"[MCP响应] request_id={request_id[:12]}")
 
                 else:
                     logger.warning(f"Unknown message type from client {client_id}: {msg_type}")

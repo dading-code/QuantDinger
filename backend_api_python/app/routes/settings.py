@@ -133,6 +133,7 @@ CONFIG_SCHEMA = {
                     {'value': 'grok', 'label': 'xAI Grok'},
                     {'value': 'custom', 'label': 'Custom API (OpenAI-compatible)'},
                     {'value': 'minimax', 'label': 'MiniMax'},
+                    {'value': 'anythingllm', 'label': 'AnythingLLM (Local workspace)'},
                 ],
                 'description': 'Select your preferred LLM provider'
             },
@@ -316,6 +317,33 @@ CONFIG_SCHEMA = {
                 'default': 'https://api.minimax.io/v1',
                 'description': 'MiniMax API endpoint',
                 'group': 'minimax'
+            },
+            # AnythingLLM
+            {
+                'key': 'ANYTHINGLLM_API_KEY',
+                'label': 'AnythingLLM API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'http://localhost:3001/settings#security',
+                'link_text': 'Get API Key',
+                'description': 'AnythingLLM workspace API key for local LLM',
+                'group': 'anythingllm'
+            },
+            {
+                'key': 'ANYTHINGLLM_WORKSPACE_URL',
+                'label': 'AnythingLLM Workspace URL',
+                'type': 'text',
+                'default': 'http://localhost:3001/api/workspace/',
+                'description': 'AnythingLLM workspace endpoint URL, e.g. http://localhost:3001/api/workspace/your-workspace-slug',
+                'group': 'anythingllm'
+            },
+            {
+                'key': 'ANYTHINGLLM_MODEL',
+                'label': 'AnythingLLM Model',
+                'type': 'text',
+                'default': '',
+                'description': 'Model name (optional). Leave empty to use workspace default',
+                'group': 'anythingllm'
             },
             # Common settings
             {

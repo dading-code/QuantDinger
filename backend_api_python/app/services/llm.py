@@ -25,6 +25,7 @@ class LLMProvider(Enum):
     GROK = "grok"
     CUSTOM = "custom"
     MINIMAX = "minimax"
+    ANYTHINGLLM = "anythingllm"
 
 
 # Provider configurations
@@ -63,6 +64,11 @@ PROVIDER_CONFIGS = {
         "base_url": "https://api.minimax.io/v1",
         "default_model": "MiniMax-M2.7",
         "fallback_model": "MiniMax-M2.7-highspeed",
+    },
+    LLMProvider.ANYTHINGLLM: {
+        "base_url": "",  # User configured via ANYTHINGLLM_WORKSPACE_URL
+        "default_model": "",  # Uses workspace default model
+        "fallback_model": "",
     },
 }
 
@@ -132,6 +138,7 @@ class LLMService:
             LLMProvider.GROK: APIKeys.GROK_API_KEY,
             LLMProvider.CUSTOM: APIKeys.CUSTOM_API_KEY,
             LLMProvider.MINIMAX: APIKeys.MINIMAX_API_KEY,
+            LLMProvider.ANYTHINGLLM: APIKeys.ANYTHINGLLM_API_KEY,
         }
         return key_map.get(p, "") or ""
 
@@ -146,6 +153,9 @@ class LLMService:
         # PR #56 uses CUSTOM_API_URL (not CUSTOM_BASE_URL); APIKeys mirrors env + addon.
         if p == LLMProvider.CUSTOM and not custom_url:
             custom_url = (os.getenv("CUSTOM_API_URL", "").strip() or (APIKeys.CUSTOM_API_URL or "")).strip()
+        # AnythingLLM uses ANYTHINGLLM_WORKSPACE_URL
+        if p == LLMProvider.ANYTHINGLLM and not custom_url:
+            custom_url = (os.getenv("ANYTHINGLLM_WORKSPACE_URL", "").strip() or (APIKeys.ANYTHINGLLM_WORKSPACE_URL or "")).strip()
 
         if custom_url:
             return custom_url.rstrip('/')
@@ -237,6 +247,11 @@ class LLMService:
                 data["response_format"] = {"type": "json_object"}
 
         response = requests.post(url, headers=headers, json=data, timeout=timeout)
+        
+        # Log response for debugging
+        logger.info(f"AnythingLLM Response Status: {response.status_code}")
+        logger.info(f"AnythingLLM Response Headers: {dict(response.headers)}")
+        logger.info(f"AnythingLLM Response Text (first 500 chars): {response.text[:500]}")
         
         # Handle non-2xx with provider/model-aware details
         if response.status_code >= 400:

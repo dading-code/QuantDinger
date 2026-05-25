@@ -141,6 +141,39 @@ class MetaAPIKeys(type):
         return val if val else ''
     
     @property
+    def ANYTHINGLLM_API_KEY(cls):
+        """AnythingLLM workspace API key (supports both ANYTHINGLLM_API_KEY and ANYTHING_LLM_KEY)"""
+        # Try new naming first
+        env_val = os.getenv('ANYTHINGLLM_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        # Fallback to old naming for backward compatibility
+        env_val_old = os.getenv('ANYTHING_LLM_KEY', '').strip()
+        if env_val_old:
+            return env_val_old
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('anythingllm', {}).get('api_key')
+        return val if val else ''
+    
+    @property
+    def ANYTHINGLLM_WORKSPACE_URL(cls):
+        """AnythingLLM workspace URL (supports both ANYTHINGLLM_WORKSPACE_URL and ANYTHING_LLM_BASE_URL + workspace)"""
+        # Try new naming first
+        env_val = os.getenv('ANYTHINGLLM_WORKSPACE_URL', '').strip()
+        if env_val:
+            return env_val
+        # Fallback to old naming: ANYTHING_LLM_BASE_URL + workspace
+        base_url = os.getenv('ANYTHING_LLM_BASE_URL', '').strip()
+        workspace = os.getenv('ANYTHING_LLM_WORKSPACE', '').strip()
+        if base_url and workspace:
+            # Construct full workspace URL (matching reference project format)
+            base_url = base_url.rstrip('/')
+            return f"{base_url}/api/v1/workspace/{workspace}/chat"
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('anythingllm', {}).get('workspace_url')
+        return val if val else ''
+    
+    @property
     def TAVILY_API_KEYS(cls):
         """Tavily Search API keys (comma-separated for rotation)"""
         env_val = os.getenv('TAVILY_API_KEYS', '').strip()

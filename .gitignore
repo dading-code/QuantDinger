@@ -48,9 +48,20 @@ build/
 venv/
 .venv/
 env/
+*.so
+.Python
+develop-eggs/
+downloads/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+.installed.cfg
 
 # ========================
-# Node (if any remain)
+# Node
 # ========================
 node_modules/
 npm-debug.log*
@@ -58,6 +69,7 @@ yarn-debug.log*
 yarn-error.log*
 package-lock.json
 yarn.lock
+pnpm-lock.yaml
 
 # ========================
 # Logs & Runtime Data
@@ -67,11 +79,17 @@ backend_api_python/logs/
 # Vue build output belongs in frontend/dist/, not under the API package
 backend_api_python/dist/
 
-# MCP server build artifacts (PyPI release output, never committed)
+# ========================
+# MCP Server Build
+# ========================
 mcp_server/dist/
 mcp_server/build/
 mcp_server/.smoketest/
 mcp_server/src/quantdinger_mcp.egg-info/
+
+# ========================
+# Database & Cache
+# ========================
 backend_api_python/data/quantdinger.db
 backend_api_python/data/memory/
 
@@ -86,3 +104,17 @@ QuantDinger-Vue-src/src/locales/lang/*.bak
 # ========================
 docker-compose.override.yml
 nul
+
+# ========================
+# Build & Pack
+# ========================
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+*.dmg
+*.exe
+*.msi
+*.deb
+*.rpm

@@ -727,10 +727,13 @@ def ai_generate():
 
     Local-first: if OpenRouter key is not configured, we return a reasonable template.
     """
+    logger.info(f"🔴 ai_generate called! Request data: {request.get_json()}")
     data = request.get_json() or {}
     lang = _request_lang()
     prompt = (data.get("prompt") or "").strip()
     existing = (data.get("existingCode") or "").strip()
+    
+    logger.info(f"🔴 Prompt received: '{prompt[:100] if prompt else 'EMPTY'}'")
 
     if not prompt:
         # Keep SSE contract (match PHP behavior) so frontend doesn't look "stuck".

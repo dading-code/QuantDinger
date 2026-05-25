@@ -149,6 +149,9 @@ class USStockDataSource(BaseDataSource):
     
     name = "USStock/yfinance"
     
+    # 已知的非美股符号（应该使用其他数据源）
+    NON_STOCK_SYMBOLS = {'XAUUSD', 'XAUEUR', 'XAGUSD', 'GOLD', 'SILVER'}
+    
     # yfinance 时间周期映射
     INTERVAL_MAP = {
         '1m': '1m',
@@ -232,6 +235,11 @@ class USStockDataSource(BaseDataSource):
             }
         """
         symbol = (symbol or '').strip().upper()
+        
+        # 快速跳过非美股符号
+        if symbol in self.NON_STOCK_SYMBOLS:
+            logger.debug(f"Skipping non-stock symbol {symbol} in USStock datasource")
+            return {'last': 0, 'symbol': symbol}
         
         # 优先使用 Finnhub（实时数据）
         if self.finnhub_client:
@@ -339,6 +347,12 @@ class USStockDataSource(BaseDataSource):
         优先级：Finnhub → Twelve Data → yfinance
         """
         klines = []
+        
+        # 快速跳过非美股符号
+        symbol_upper = (symbol or '').strip().upper()
+        if symbol_upper in self.NON_STOCK_SYMBOLS:
+            logger.debug(f"Skipping non-stock symbol {symbol} in USStock datasource")
+            return klines
         
         try:
             interval = self.INTERVAL_MAP.get(timeframe, '1d')
