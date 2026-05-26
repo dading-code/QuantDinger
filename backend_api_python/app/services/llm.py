@@ -25,7 +25,6 @@ class LLMProvider(Enum):
     GROK = "grok"
     CUSTOM = "custom"
     MINIMAX = "minimax"
-    ANYTHINGLLM = "anythingllm"
 
 
 # Provider configurations
@@ -64,11 +63,6 @@ PROVIDER_CONFIGS = {
         "base_url": "https://api.minimax.io/v1",
         "default_model": "MiniMax-M2.7",
         "fallback_model": "MiniMax-M2.7-highspeed",
-    },
-    LLMProvider.ANYTHINGLLM: {
-        "base_url": "",  # User configured via ANYTHINGLLM_WORKSPACE_URL
-        "default_model": "",  # Uses workspace default model
-        "fallback_model": "",
     },
 }
 
@@ -138,7 +132,6 @@ class LLMService:
             LLMProvider.GROK: APIKeys.GROK_API_KEY,
             LLMProvider.CUSTOM: APIKeys.CUSTOM_API_KEY,
             LLMProvider.MINIMAX: APIKeys.MINIMAX_API_KEY,
-            LLMProvider.ANYTHINGLLM: APIKeys.ANYTHINGLLM_API_KEY,
         }
         return key_map.get(p, "") or ""
 
@@ -153,9 +146,6 @@ class LLMService:
         # PR #56 uses CUSTOM_API_URL (not CUSTOM_BASE_URL); APIKeys mirrors env + addon.
         if p == LLMProvider.CUSTOM and not custom_url:
             custom_url = (os.getenv("CUSTOM_API_URL", "").strip() or (APIKeys.CUSTOM_API_URL or "")).strip()
-        # AnythingLLM uses ANYTHINGLLM_WORKSPACE_URL
-        if p == LLMProvider.ANYTHINGLLM and not custom_url:
-            custom_url = (os.getenv("ANYTHINGLLM_WORKSPACE_URL", "").strip() or (APIKeys.ANYTHINGLLM_WORKSPACE_URL or "")).strip()
 
         if custom_url:
             return custom_url.rstrip('/')
@@ -194,64 +184,28 @@ class LLMService:
     def _call_openai_compatible(self, messages: list, model: str, temperature: float, 
                                  api_key: str, base_url: str, timeout: int,
                                  use_json_mode: bool = True) -> str:
-        """Call OpenAI-compatible API (OpenAI, DeepSeek, Grok, OpenRouter, AnythingLLM)."""
-        if "/chat/completions" in base_url:
-            url = base_url
-        elif "/workspace/" in base_url:
-            url = base_url
-        else:
-            url = f"{base_url}/chat/completions"
+        """Call OpenAI-compatible API (OpenAI, DeepSeek, Grok, OpenRouter)."""
+        url = f"{base_url}/chat/completions"
         
         headers = {"Content-Type": "application/json"}
-        
         if (api_key or "").strip():
             headers["Authorization"] = f"Bearer {api_key.strip()}"
-        
-        logger.debug(f"LLM request URL: {url}")
-        logger.debug(f"LLM request headers: {headers}")
         
         # OpenRouter specific headers
         if "openrouter" in base_url:
             headers["HTTP-Referer"] = "https://quantdinger.com"
             headers["X-Title"] = "QuantDinger Analysis"
 
-        # AnythingLLM workspace endpoint uses different format
-        if "/workspace/" in base_url:
-            # AnythingLLM format: {"message": "...", "mode": "query", "threadSlug": "..."}
-            user_message = ""
-            for msg in messages:
-                if msg.get("role") == "user":
-                    user_message = msg.get("content", "")
-                    break
-            if not user_message and messages:
-                user_message = messages[-1].get("content", "")
-            
-            # 🔴 [关键修复] AnythingLLM 需要 threadSlug 参数来隔离并发请求
-            import uuid
-            thread_slug = f"req_{uuid.uuid4().hex[:16]}"
-            
-            data = {
-                "message": user_message,
-                "mode": "query",
-                "threadSlug": thread_slug
-            }
-        else:
-            # Standard OpenAI-compatible format
-            data = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-            }
-            
-            if use_json_mode:
-                data["response_format"] = {"type": "json_object"}
+        data = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        
+        if use_json_mode:
+            data["response_format"] = {"type": "json_object"}
 
         response = requests.post(url, headers=headers, json=data, timeout=timeout)
-        
-        # Log response for debugging
-        logger.info(f"AnythingLLM Response Status: {response.status_code}")
-        logger.info(f"AnythingLLM Response Headers: {dict(response.headers)}")
-        logger.info(f"AnythingLLM Response Text (first 500 chars): {response.text[:500]}")
         
         # Handle non-2xx with provider/model-aware details
         if response.status_code >= 400:
@@ -284,18 +238,6 @@ class LLMService:
             raise ValueError(error_msg)
         
         result = response.json()
-        
-        # Handle AnythingLLM response format
-        if "/workspace/" in base_url:
-            if "textResponse" in result:
-                content = result.get("textResponse", "")
-                if not content:
-                    raise ValueError(f"Model returned empty content")
-                return content
-            else:
-                raise ValueError(f"AnythingLLM response missing 'textResponse': {result}")
-        
-        # Standard OpenAI-compatible format
         if "choices" in result and len(result["choices"]) > 0:
             content = result["choices"][0]["message"]["content"]
             if not content:
@@ -636,10 +578,6 @@ class LLMService:
             
             # Strip markdown fences if present
             clean_text = response_text.strip()
-            
-            # Remove <think> tags (common in some LLM outputs)
-            clean_text = clean_text.replace("<think>", "").replace("</think>", "")
-            
             if clean_text.startswith("```"):
                 first_newline = clean_text.find("\n")
                 if first_newline != -1:
@@ -661,24 +599,6 @@ class LLMService:
                     end = response_text.rfind('}') + 1
                     if start >= 0 and end > start:
                         result = json.loads(response_text[start:end])
-                        return result
-            except:
-                pass
-            
-            # 🔴 [修复] 如果 LLM 返回的不是 JSON，而是纯文本，尝试提取分析内容
-            try:
-                if response_text:
-                    # 移除 <think> 标签
-                    clean_text = response_text.replace("<think>", "").replace("</think>", "").strip()
-                    logger.info(f"[LLM Fallback] Cleaned text length: {len(clean_text)}, preview: {clean_text[:200]}")
-                    # 如果文本看起来像分析内容，将其放入 summary 和其他字段
-                    if len(clean_text) > 50:
-                        # 使用默认结构但填充文本内容
-                        result = default_structure.copy()
-                        result['summary'] = clean_text[:500] if len(clean_text) > 500 else clean_text
-                        result['key_reasons'] = ["Analysis completed", "LLM returned text response"]
-                        result['risks'] = ["Data format warning: LLM did not return JSON format"]
-                        logger.info(f"[LLM Fallback] Returning text summary, length: {len(result['summary'])}")
                         return result
             except:
                 pass

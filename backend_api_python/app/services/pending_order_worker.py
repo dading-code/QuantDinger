@@ -3,21 +3,15 @@ Pending order worker.
 
 This worker polls `pending_orders` periodically and dispatches orders based on `execution_mode`:
 - signal: send notifications (no real trading).
-- live: execute via exchange API (crypto) or push to local client (MT5/IBKR).
-
-Architecture:
-- Crypto exchanges: Cloud executes directly via REST API
-- MT5/IBKR: Cloud pushes signal to local client via WebSocket, local client executes
+- live: not implemented (paper mode only).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.signal_notifier import SignalNotifier
@@ -45,6 +39,11 @@ from app.services.live_trading.symbols import to_gate_currency_pair
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.strategy_runtime_logs import append_strategy_log
+from app.services.strategy_lifecycle import (
+    auto_stop_live_strategy,
+    is_fatal_exchange_error,
+    should_skip_position_sync,
+)
 
 # Lazy import IBKR to avoid ImportError if ib_insync not installed
 IBKRClient = None
@@ -52,7 +51,105 @@ IBKRClient = None
 # Lazy import MT5 to avoid ImportError if MetaTrader5 not installed
 MT5Client = None
 
+# Lazy import Alpaca to avoid ImportError if alpaca-py not installed
+AlpacaClient = None
+
 logger = get_logger(__name__)
+
+# PositionSync: one exchange snapshot per credential per TTL window (many strategies
+# often share the same API key — without this we N× get_positions and trigger bans).
+_position_sync_snapshot_cache: Dict[str, Tuple[float, Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
+_exchange_sync_backoff_until: Dict[str, float] = {}
+_position_sync_cache_lock = threading.Lock()
+
+
+def _position_sync_cache_key(
+    user_id: int,
+    exchange_id: str,
+    market_type: str,
+    exchange_config: Dict[str, Any],
+) -> str:
+    cred_id = exchange_config.get("credential_id") or exchange_config.get("credentials_id")
+    if cred_id:
+        return f"u{int(user_id)}:{exchange_id}:{market_type}:cred:{int(cred_id)}"
+    hint = str(exchange_config.get("api_key") or exchange_config.get("apiKey") or "")[-16:]
+    return f"u{int(user_id)}:{exchange_id}:{market_type}:inline:{hint}"
+
+
+def _position_sync_cache_ttl_sec() -> float:
+    try:
+        custom = float(os.getenv("POSITION_SYNC_CACHE_TTL_SEC", "0"))
+        if custom > 0:
+            return custom
+    except Exception:
+        pass
+    try:
+        interval = float(os.getenv("POSITION_SYNC_INTERVAL_SEC", "30"))
+        return max(30.0, interval)
+    except Exception:
+        return 60.0
+
+
+def _get_position_sync_snapshot(
+    cache_key: str,
+) -> Optional[Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]]:
+    now = time.time()
+    with _position_sync_cache_lock:
+        entry = _position_sync_snapshot_cache.get(cache_key)
+        if not entry:
+            return None
+        expires, exch_size, exch_entry = entry
+        if now >= expires:
+            _position_sync_snapshot_cache.pop(cache_key, None)
+            return None
+        return exch_size, exch_entry
+
+
+def _set_position_sync_snapshot(
+    cache_key: str,
+    exch_size: Dict[str, Dict[str, float]],
+    exch_entry_price: Dict[str, Dict[str, float]],
+) -> None:
+    ttl = _position_sync_cache_ttl_sec()
+    with _position_sync_cache_lock:
+        _position_sync_snapshot_cache[cache_key] = (
+            time.time() + ttl,
+            exch_size,
+            exch_entry_price,
+        )
+
+
+def _exchange_sync_backoff_sec() -> float:
+    try:
+        return max(60.0, float(os.getenv("EXCHANGE_SYNC_BACKOFF_SEC", "900")))
+    except Exception:
+        return 900.0
+
+
+def _is_exchange_sync_backoff(cache_key: str) -> bool:
+    with _position_sync_cache_lock:
+        until = float(_exchange_sync_backoff_until.get(cache_key) or 0.0)
+    return time.time() < until
+
+
+def _set_exchange_sync_backoff(cache_key: str, seconds: Optional[float] = None) -> None:
+    sec = float(seconds if seconds is not None else _exchange_sync_backoff_sec())
+    with _position_sync_cache_lock:
+        _exchange_sync_backoff_until[cache_key] = time.time() + sec
+
+
+def _is_exchange_rate_limit_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(
+        token in m
+        for token in (
+            "418",
+            "-1003",
+            "too many requests",
+            "rate limit",
+            "banned until",
+        )
+    )
 
 
 class PendingOrderWorker:
@@ -72,7 +169,7 @@ class PendingOrderWorker:
 
         # Position sync self-check (best-effort): keep local positions aligned with exchange.
         self._position_sync_enabled = os.getenv("POSITION_SYNC_ENABLED", "true").lower() == "true"
-        self._position_sync_interval_sec = float(os.getenv("POSITION_SYNC_INTERVAL_SEC", "10"))
+        self._position_sync_interval_sec = float(os.getenv("POSITION_SYNC_INTERVAL_SEC", "30"))
         self._last_position_sync_ts = 0.0
         logger.info(f"PendingOrderWorker: sync_enabled={self._position_sync_enabled}, interval={self._position_sync_interval_sec}s")
 
@@ -197,7 +294,9 @@ class PendingOrderWorker:
             logger.debug(f"[PositionSync] Found {len(active_rows)} active live strategies in DB.")
             for _ar in active_rows:
                 _sid = int(_ar.get("id") or 0)
-                if _sid > 0 and _sid not in sid_to_rows:
+                if _sid <= 0 or should_skip_position_sync(_sid):
+                    continue
+                if _sid not in sid_to_rows:
                     if target_strategy_id and target_strategy_id != _sid:
                         continue
                     sid_to_rows[_sid] = []
@@ -207,6 +306,8 @@ class PendingOrderWorker:
         # 2) Reconcile per strategy
         for sid, plist in sid_to_rows.items():
             if target_strategy_id and sid != target_strategy_id:
+                continue
+            if should_skip_position_sync(int(sid)):
                 continue
             try:
                 sc = load_strategy_configs(int(sid))
@@ -244,7 +345,9 @@ class PendingOrderWorker:
                     if sym and isinstance(sym, str):
                         allowed_symbols.add(sym.strip().upper())
 
-                # Lazy import MT5 here to allow elif chain later
+                # Lazy import MT5 / IBKR / Alpaca clients here so the elif chain
+                # below can rely on isinstance() checks without paying the import
+                # cost on systems that don't ship those broker libs.
                 global MT5Client
                 if MT5Client is None:
                     try:
@@ -253,266 +356,413 @@ class PendingOrderWorker:
                     except ImportError:
                         pass
 
-                # 尝试创建客户端，如果失败则跳过（可能是配置错误）
-                try:
-                    client = create_client(exchange_config, market_type=market_type)
-                except Exception as e:
-                    logger.debug(f"[PositionSync] Strategy {sid} skipped: failed to create client (exchange_id={exchange_id}): {e}")
-                    continue
-                
-                # Build an "exchange snapshot" per symbol+side
-                exch_size: Dict[str, Dict[str, float]] = {}  # {symbol: {long: size, short: size}}
-                exch_entry_price: Dict[str, Dict[str, float]] = {} # {symbol: {long: px, short: px}}
+                global IBKRClient
+                if IBKRClient is None:
+                    try:
+                        from app.services.ibkr_trading import IBKRClient as _IBKRClient
+                        IBKRClient = _IBKRClient
+                    except ImportError:
+                        pass
 
-                if isinstance(client, BinanceFuturesClient) and market_type == "swap":
-                    all_pos = client.get_positions() or []
-                    # Handle dict response if needed (wrapper)
-                    if isinstance(all_pos, dict) and "raw" in all_pos:
-                         all_pos = all_pos["raw"]
-                    
-                    if isinstance(all_pos, list):
-                        for p in all_pos:
-                            sym = str(p.get("symbol") or "").strip().upper()
-                            try:
-                                amt = float(p.get("positionAmt") or 0.0)
-                                ep = float(p.get("entryPrice") or 0.0)
-                            except Exception:
-                                amt = 0.0
-                                ep = 0.0
-                            if not sym or abs(amt) <= 0:
-                                continue
-                            # Map to our symbol format: BTCUSDT -> BTC/USDT (best-effort)
-                            hb_sym = sym
-                            if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
-                                hb_sym = f"{hb_sym[:-4]}/USDT"
-                            side = "long" if amt > 0 else "short"
-                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(amt))
-                            exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(ep))
+                global AlpacaClient
+                if AlpacaClient is None:
+                    try:
+                        from app.services.alpaca_trading import AlpacaClient as _AlpacaClient
+                        AlpacaClient = _AlpacaClient
+                    except ImportError:
+                        pass
 
-                elif isinstance(client, OkxClient) and market_type == "swap":
-                    resp = client.get_positions()
-                    data = (resp.get("data") or []) if isinstance(resp, dict) else []
-                    if isinstance(data, list):
-                        for p in data:
-                            inst_id = str(p.get("instId") or "")
-                            pos_side = str(p.get("posSide") or "").lower()
-                            try:
-                                pos = float(p.get("pos") or 0.0)
-                            except Exception:
-                                pos = 0.0
-                            if not inst_id or abs(pos) <= 0:
-                                continue
-                            # instId: BTC-USDT-SWAP -> BTC/USDT
-                            hb_sym = inst_id.replace("-SWAP", "").replace("-", "/")
-                            side = "long" if pos_side == "long" else ("short" if pos_side == "short" else ("long" if pos > 0 else "short"))
-                            # IMPORTANT: OKX swap positions `pos` is in contracts, but our system uses base-asset quantity.
-                            # Convert contracts -> base using ctVal when available.
-                            qty_base = abs(float(pos))
-                            try:
-                                inst = client.get_instrument(inst_type="SWAP", inst_id=inst_id) or {}
-                                ct_val = float(inst.get("ctVal") or 0.0)
-                                if ct_val > 0:
-                                    qty_base = qty_base * ct_val
-                            except Exception:
-                                pass
-                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
-                            
-                            # Extract entry price from OKX position data
-                            # OKX API returns avgPx (average price) or avgPxEp (average price in equity) for positions
-                            try:
-                                # Try avgPx first (average entry price)
-                                avg_px = p.get("avgPx")
-                                if avg_px:
-                                    entry_price = float(avg_px)
-                                else:
-                                    # Fallback to avgPxEp (average price in equity)
-                                    avg_px_ep = p.get("avgPxEp")
-                                    if avg_px_ep:
-                                        entry_price = float(avg_px_ep)
-                                    else:
-                                        # Fallback to last price if available
-                                        last_px = p.get("last")
-                                        entry_price = float(last_px) if last_px else 0.0
-                                
-                                if entry_price > 0:
-                                    exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = entry_price
-                                    logger.debug(f"[PositionSync] OKX {hb_sym} {side}: entry_price={entry_price} from avgPx={p.get('avgPx')} or avgPxEp={p.get('avgPxEp')}")
-                                else:
-                                    logger.warning(f"[PositionSync] OKX {hb_sym} {side}: Could not extract entry price from position data: {p}")
-                            except Exception as e:
-                                logger.warning(f"[PositionSync] Failed to extract entry price for OKX {hb_sym} {side}: {e}")
-                                # Don't set entry_price, will remain 0.0
+                cache_key = _position_sync_cache_key(sync_user_id, exchange_id, market_type, exchange_config)
+                cached_snap = _get_position_sync_snapshot(cache_key)
+                exch_size: Dict[str, Dict[str, float]] = {}
+                exch_entry_price: Dict[str, Dict[str, float]] = {}
 
-                elif isinstance(client, BitgetMixClient) and market_type == "swap":
-                    product_type = str(exchange_config.get("product_type") or exchange_config.get("productType") or "USDT-FUTURES")
-                    resp = client.get_positions(product_type=product_type)
-                    data = resp.get("data") if isinstance(resp, dict) else None
-                    if isinstance(data, list):
-                        for p in data:
-                            sym = str(p.get("symbol") or "")
-                            hold_side = str(p.get("holdSide") or "").lower()
-                            try:
-                                total = float(p.get("total") or 0.0)
-                            except Exception:
-                                total = 0.0
-                            if not sym or abs(total) <= 0:
-                                continue
-                            hb_sym = sym.upper()
-                            if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
-                                hb_sym = f"{hb_sym[:-4]}/USDT"
-                            side = "long" if hold_side == "long" else "short"
-                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(total))
-                            try:
-                                ep = float(p.get("openPriceAvg") or p.get("averageOpenPrice") or 0.0)
-                                if ep > 0:
-                                    exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
-                            except Exception:
-                                pass
-
-                elif isinstance(client, BybitClient) and market_type == "swap":
-                    # Bybit v5 requires symbol or settleCoin — use USDT for full linear book
-                    resp = client.get_positions(settle_coin="USDT")
-                    lst = (((resp.get("result") or {}).get("list")) if isinstance(resp, dict) else None) or []
-                    if isinstance(lst, list):
-                        for p in lst:
-                            if not isinstance(p, dict):
-                                continue
-                            sym = str(p.get("symbol") or "").strip().upper()
-                            side0 = str(p.get("side") or "").strip().lower()  # Buy/Sell
-                            try:
-                                sz = float(p.get("size") or 0.0)
-                            except Exception:
-                                sz = 0.0
-                            if not sym or abs(sz) <= 0:
-                                continue
-                            hb_sym = sym
-                            if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
-                                hb_sym = f"{hb_sym[:-4]}/USDT"
-                            side = "long" if side0 == "buy" else ("short" if side0 == "sell" else ("long" if sz > 0 else "short"))
-                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
-                            try:
-                                ep = float(p.get("avgPrice") or p.get("entryPrice") or 0.0)
-                                if ep > 0:
-                                    exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
-                            except Exception:
-                                pass
-
-                elif isinstance(client, GateUsdtFuturesClient) and market_type == "swap":
-                    resp = client.get_positions()
-                    items = resp if isinstance(resp, list) else []
-                    if isinstance(items, list):
-                        for p in items:
-                            if not isinstance(p, dict):
-                                continue
-                            contract = str(p.get("contract") or "").strip()
-                            try:
-                                sz_ct = float(p.get("size") or 0.0)  # contracts, signed
-                            except Exception:
-                                sz_ct = 0.0
-                            if not contract or abs(sz_ct) <= 0:
-                                continue
-                            hb_sym = contract.replace("_", "/")
-                            side = "long" if sz_ct > 0 else "short"
-                            # Convert contracts -> base using quanto_multiplier.
-                            qty_base = abs(sz_ct)
-                            try:
-                                meta = client.get_contract(contract=contract) or {}
-                                qm = float(meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0)
-                                if qm > 0:
-                                    qty_base = qty_base * qm
-                            except Exception:
-                                pass
-                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
-                            try:
-                                ep = float(p.get("entry_price") or p.get("open_price") or 0.0)
-                                if ep > 0:
-                                    exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
-                            except Exception:
-                                pass
-
-                elif isinstance(client, KucoinFuturesClient) and market_type == "swap":
-                    resp = client.get_positions()
-                    data = (resp.get("data") if isinstance(resp, dict) else None) or []
-                    if isinstance(data, list):
-                        for p in data:
-                            if not isinstance(p, dict):
-                                continue
-                            sym = str(p.get("symbol") or "").strip()
-                            try:
-                                qty_ct = float(p.get("currentQty") or p.get("quantity") or 0.0)
-                            except Exception:
-                                qty_ct = 0.0
-                            if not sym or abs(qty_ct) <= 0:
-                                continue
-                            side = "long" if qty_ct > 0 else "short"
-                            # Convert contracts -> base using multiplier.
-                            qty_base = abs(qty_ct)
-                            try:
-                                meta = client.get_contract(symbol=sym) or {}
-                                mult = float(meta.get("multiplier") or meta.get("lotSize") or 0.0)
-                                if mult > 0:
-                                    qty_base = qty_base * mult
-                            except Exception:
-                                pass
-                            exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
-                            try:
-                                ep = float(p.get("avgEntryPrice") or p.get("realLeverage") and float(p.get("posCost") or 0) / max(abs(qty_ct), 1e-12) or 0.0)
-                                if ep > 0:
-                                    exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
-                            except Exception:
-                                pass
-
-                elif isinstance(client, KrakenFuturesClient) and market_type == "swap":
-                    resp = client.get_open_positions()
-                    positions = (resp.get("openPositions") if isinstance(resp, dict) else None) or (resp.get("open_positions") if isinstance(resp, dict) else None) or []
-                    if isinstance(positions, list):
-                        for p in positions:
-                            if not isinstance(p, dict):
-                                continue
-                            sym = str(p.get("symbol") or p.get("instrument") or "").strip()
-                            try:
-                                sz = float(p.get("size") or p.get("positionSize") or 0.0)
-                            except Exception:
-                                sz = 0.0
-                            if not sym or abs(sz) <= 0:
-                                continue
-                            side = "long" if sz > 0 else "short"
-                            exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
-                            try:
-                                ep = float(p.get("price") or p.get("avgPrice") or 0.0)
-                                if ep > 0:
-                                    exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
-                            except Exception:
-                                pass
-
-                elif MT5Client is not None and isinstance(client, MT5Client):
-                    # MT5 forex positions
-                    positions = client.get_positions()
-                    if isinstance(positions, list):
-                        for p in positions:
-                            if not isinstance(p, dict):
-                                continue
-                            sym = str(p.get("symbol") or "").strip()
-                            pos_type = str(p.get("type") or "").strip().lower()
-                            try:
-                                vol = float(p.get("volume") or 0.0)
-                            except Exception:
-                                vol = 0.0
-                            if not sym or vol <= 0:
-                                continue
-                            # MT5: type "buy" = long, "sell" = short
-                            side = "long" if pos_type == "buy" else "short"
-                            exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = float(vol)
-                    # Continue to reconciliation logic below
+                if cached_snap is not None:
+                    exch_size, exch_entry_price = cached_snap
                 else:
-                    # Spot reconciliation is optional; skip for now (keeps self-check low-risk).
-                    logger.debug(f"position sync: skip unsupported market/client: sid={sid}, cfg={safe_cfg}, market_type={market_type}, client={type(client)}")
-                    continue
+                    if _is_exchange_sync_backoff(cache_key):
+                        logger.warning(
+                            "[PositionSync] Strategy %s skipped: %s sync backoff active (key=%s)",
+                            sid,
+                            exchange_id,
+                            cache_key,
+                        )
+                        continue
+
+                    # 尝试创建客户端，如果失败则跳过（可能是配置错误）
+                    try:
+                        client = create_client(exchange_config, market_type=market_type)
+                    except Exception as e:
+                        msg = str(e)
+                        if is_fatal_exchange_error(msg):
+                            logger.error(
+                                "[PositionSync] Strategy %s fatal client error; auto-stopping. error=%s",
+                                sid,
+                                msg,
+                            )
+                            auto_stop_live_strategy(int(sid), msg, source="position_sync_client")
+                        else:
+                            logger.debug(
+                                f"[PositionSync] Strategy {sid} skipped: failed to create client (exchange_id={exchange_id}): {e}"
+                            )
+                        continue
+
+                    if isinstance(client, BinanceFuturesClient) and market_type == "swap":
+                        try:
+                            all_pos = client.get_positions() or []
+                        except Exception as e:
+                            msg = str(e)
+                            if is_fatal_exchange_error(msg):
+                                logger.error(f"[PositionSync] Strategy {sid} fatal auth error; auto-stopping. error={msg}")
+                                auto_stop_live_strategy(int(sid), msg, source="position_sync_binance")
+                                continue
+                            if _is_exchange_rate_limit_error(msg):
+                                _set_exchange_sync_backoff(cache_key)
+                                logger.error(
+                                    "[PositionSync] Binance rate limit for key=%s; backing off %ss. error=%s",
+                                    cache_key,
+                                    int(_exchange_sync_backoff_sec()),
+                                    msg,
+                                )
+                                continue
+                            logger.error(f"[PositionSync] Strategy {sid} get_positions failed: {msg}", exc_info=True)
+                            continue
+                        if isinstance(all_pos, dict) and "raw" in all_pos:
+                            all_pos = all_pos["raw"]
+
+                        if isinstance(all_pos, list):
+                            for p in all_pos:
+                                sym = str(p.get("symbol") or "").strip().upper()
+                                try:
+                                    amt = float(p.get("positionAmt") or 0.0)
+                                    ep = float(p.get("entryPrice") or 0.0)
+                                except Exception:
+                                    amt = 0.0
+                                    ep = 0.0
+                                if not sym or abs(amt) <= 0:
+                                    continue
+                                hb_sym = sym
+                                if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
+                                    hb_sym = f"{hb_sym[:-4]}/USDT"
+                                side = "long" if amt > 0 else "short"
+                                exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(amt))
+                                exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(ep))
+
+
+                    elif isinstance(client, OkxClient) and market_type == "swap":
+                        try:
+                            resp = client.get_positions()
+                        except Exception as e:
+                            # Fatal auth/config errors should auto-stop the strategy to avoid endless spam.
+                            # Typical OKX response: HTTP 401 {"msg":"Invalid OK-ACCESS-KEY","code":"50111"}
+                            msg = str(e)
+                            m = msg.lower()
+                            if is_fatal_exchange_error(msg):
+                                logger.error(f"[PositionSync] Strategy {sid} fatal auth error; auto-stopping. error={msg}")
+                                auto_stop_live_strategy(int(sid), msg, source="position_sync_okx")
+                                continue
+                            # Non-fatal: keep syncing other strategies, but don't crash the worker loop.
+                            logger.error(f"[PositionSync] Strategy {sid} get_positions failed: {msg}", exc_info=True)
+                            continue
+                        data = (resp.get("data") or []) if isinstance(resp, dict) else []
+                        if isinstance(data, list):
+                            for p in data:
+                                inst_id = str(p.get("instId") or "")
+                                pos_side = str(p.get("posSide") or "").lower()
+                                try:
+                                    pos = float(p.get("pos") or 0.0)
+                                except Exception:
+                                    pos = 0.0
+                                if not inst_id or abs(pos) <= 0:
+                                    continue
+                                # instId: BTC-USDT-SWAP -> BTC/USDT
+                                hb_sym = inst_id.replace("-SWAP", "").replace("-", "/")
+                                side = "long" if pos_side == "long" else ("short" if pos_side == "short" else ("long" if pos > 0 else "short"))
+                                # IMPORTANT: OKX swap positions `pos` is in contracts, but our system uses base-asset quantity.
+                                # Convert contracts -> base using ctVal when available.
+                                qty_base = abs(float(pos))
+                                try:
+                                    inst = client.get_instrument(inst_type="SWAP", inst_id=inst_id) or {}
+                                    ct_val = float(inst.get("ctVal") or 0.0)
+                                    if ct_val > 0:
+                                        qty_base = qty_base * ct_val
+                                except Exception:
+                                    pass
+                                exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+                            
+                                # Extract entry price from OKX position data
+                                # OKX API returns avgPx (average price) or avgPxEp (average price in equity) for positions
+                                try:
+                                    # Try avgPx first (average entry price)
+                                    avg_px = p.get("avgPx")
+                                    if avg_px:
+                                        entry_price = float(avg_px)
+                                    else:
+                                        # Fallback to avgPxEp (average price in equity)
+                                        avg_px_ep = p.get("avgPxEp")
+                                        if avg_px_ep:
+                                            entry_price = float(avg_px_ep)
+                                        else:
+                                            # Fallback to last price if available
+                                            last_px = p.get("last")
+                                            entry_price = float(last_px) if last_px else 0.0
+                                
+                                    if entry_price > 0:
+                                        exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = entry_price
+                                        logger.debug(f"[PositionSync] OKX {hb_sym} {side}: entry_price={entry_price} from avgPx={p.get('avgPx')} or avgPxEp={p.get('avgPxEp')}")
+                                    else:
+                                        logger.warning(f"[PositionSync] OKX {hb_sym} {side}: Could not extract entry price from position data: {p}")
+                                except Exception as e:
+                                    logger.warning(f"[PositionSync] Failed to extract entry price for OKX {hb_sym} {side}: {e}")
+                                    # Don't set entry_price, will remain 0.0
+
+                    elif isinstance(client, BitgetMixClient) and market_type == "swap":
+                        product_type = str(exchange_config.get("product_type") or exchange_config.get("productType") or "USDT-FUTURES")
+                        resp = client.get_positions(product_type=product_type)
+                        data = resp.get("data") if isinstance(resp, dict) else None
+                        if isinstance(data, list):
+                            for p in data:
+                                sym = str(p.get("symbol") or "")
+                                hold_side = str(p.get("holdSide") or "").lower()
+                                try:
+                                    total = float(p.get("total") or 0.0)
+                                except Exception:
+                                    total = 0.0
+                                if not sym or abs(total) <= 0:
+                                    continue
+                                hb_sym = sym.upper()
+                                if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
+                                    hb_sym = f"{hb_sym[:-4]}/USDT"
+                                side = "long" if hold_side == "long" else "short"
+                                exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(total))
+                                try:
+                                    ep = float(p.get("openPriceAvg") or p.get("averageOpenPrice") or 0.0)
+                                    if ep > 0:
+                                        exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
+                                except Exception:
+                                    pass
+
+                    elif isinstance(client, BybitClient) and market_type == "swap":
+                        # Bybit v5 requires symbol or settleCoin — use USDT for full linear book
+                        resp = client.get_positions(settle_coin="USDT")
+                        lst = (((resp.get("result") or {}).get("list")) if isinstance(resp, dict) else None) or []
+                        if isinstance(lst, list):
+                            for p in lst:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol") or "").strip().upper()
+                                side0 = str(p.get("side") or "").strip().lower()  # Buy/Sell
+                                try:
+                                    sz = float(p.get("size") or 0.0)
+                                except Exception:
+                                    sz = 0.0
+                                if not sym or abs(sz) <= 0:
+                                    continue
+                                hb_sym = sym
+                                if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
+                                    hb_sym = f"{hb_sym[:-4]}/USDT"
+                                side = "long" if side0 == "buy" else ("short" if side0 == "sell" else ("long" if sz > 0 else "short"))
+                                exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
+                                try:
+                                    ep = float(p.get("avgPrice") or p.get("entryPrice") or 0.0)
+                                    if ep > 0:
+                                        exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
+                                except Exception:
+                                    pass
+
+                    elif isinstance(client, GateUsdtFuturesClient) and market_type == "swap":
+                        resp = client.get_positions()
+                        items = resp if isinstance(resp, list) else []
+                        if isinstance(items, list):
+                            for p in items:
+                                if not isinstance(p, dict):
+                                    continue
+                                contract = str(p.get("contract") or "").strip()
+                                try:
+                                    sz_ct = float(p.get("size") or 0.0)  # contracts, signed
+                                except Exception:
+                                    sz_ct = 0.0
+                                if not contract or abs(sz_ct) <= 0:
+                                    continue
+                                hb_sym = contract.replace("_", "/")
+                                side = "long" if sz_ct > 0 else "short"
+                                # Convert contracts -> base using quanto_multiplier.
+                                qty_base = abs(sz_ct)
+                                try:
+                                    meta = client.get_contract(contract=contract) or {}
+                                    qm = float(meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0)
+                                    if qm > 0:
+                                        qty_base = qty_base * qm
+                                except Exception:
+                                    pass
+                                exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+                                try:
+                                    ep = float(p.get("entry_price") or p.get("open_price") or 0.0)
+                                    if ep > 0:
+                                        exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = ep
+                                except Exception:
+                                    pass
+
+                    elif isinstance(client, KucoinFuturesClient) and market_type == "swap":
+                        resp = client.get_positions()
+                        data = (resp.get("data") if isinstance(resp, dict) else None) or []
+                        if isinstance(data, list):
+                            for p in data:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol") or "").strip()
+                                try:
+                                    qty_ct = float(p.get("currentQty") or p.get("quantity") or 0.0)
+                                except Exception:
+                                    qty_ct = 0.0
+                                if not sym or abs(qty_ct) <= 0:
+                                    continue
+                                side = "long" if qty_ct > 0 else "short"
+                                # Convert contracts -> base using multiplier.
+                                qty_base = abs(qty_ct)
+                                try:
+                                    meta = client.get_contract(symbol=sym) or {}
+                                    mult = float(meta.get("multiplier") or meta.get("lotSize") or 0.0)
+                                    if mult > 0:
+                                        qty_base = qty_base * mult
+                                except Exception:
+                                    pass
+                                exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+                                try:
+                                    ep = float(p.get("avgEntryPrice") or p.get("realLeverage") and float(p.get("posCost") or 0) / max(abs(qty_ct), 1e-12) or 0.0)
+                                    if ep > 0:
+                                        exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
+                                except Exception:
+                                    pass
+
+                    elif isinstance(client, KrakenFuturesClient) and market_type == "swap":
+                        resp = client.get_open_positions()
+                        positions = (resp.get("openPositions") if isinstance(resp, dict) else None) or (resp.get("open_positions") if isinstance(resp, dict) else None) or []
+                        if isinstance(positions, list):
+                            for p in positions:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol") or p.get("instrument") or "").strip()
+                                try:
+                                    sz = float(p.get("size") or p.get("positionSize") or 0.0)
+                                except Exception:
+                                    sz = 0.0
+                                if not sym or abs(sz) <= 0:
+                                    continue
+                                side = "long" if sz > 0 else "short"
+                                exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
+                                try:
+                                    ep = float(p.get("price") or p.get("avgPrice") or 0.0)
+                                    if ep > 0:
+                                        exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
+                                except Exception:
+                                    pass
+
+                    elif MT5Client is not None and isinstance(client, MT5Client):
+                        # MT5 forex positions
+                        positions = client.get_positions()
+                        if isinstance(positions, list):
+                            for p in positions:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol") or "").strip()
+                                pos_type = str(p.get("type") or "").strip().lower()
+                                try:
+                                    vol = float(p.get("volume") or 0.0)
+                                except Exception:
+                                    vol = 0.0
+                                if not sym or vol <= 0:
+                                    continue
+                                # MT5: type "buy" = long, "sell" = short
+                                side = "long" if pos_type == "buy" else "short"
+                                exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = float(vol)
+                        # Continue to reconciliation logic below
+
+                    elif IBKRClient is not None and isinstance(client, IBKRClient):
+                        # IBKR US-stock positions. `quantity` is signed: >0 = long, <0 = short.
+                        # We currently only enforce long-only entries (see _execute_ibkr_order),
+                        # but still mirror short rows so reconciliation does not orphan them
+                        # if the user had pre-existing inventory in TWS.
+                        try:
+                            positions = client.get_positions() or []
+                        except Exception as e:
+                            msg = str(e)
+                            if is_fatal_exchange_error(msg):
+                                logger.error(
+                                    "[PositionSync] Strategy %s IBKR fatal error; auto-stopping. error=%s",
+                                    sid,
+                                    msg,
+                                )
+                                auto_stop_live_strategy(int(sid), msg, source="position_sync_ibkr")
+                            else:
+                                logger.error(f"[PositionSync] Strategy {sid} IBKR get_positions failed: {e}", exc_info=True)
+                            continue
+                        if isinstance(positions, list):
+                            for p in positions:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol") or p.get("ib_symbol") or "").strip()
+                                try:
+                                    qty = float(p.get("quantity") or 0.0)
+                                except Exception:
+                                    qty = 0.0
+                                try:
+                                    avg = float(p.get("avgCost") or 0.0)
+                                except Exception:
+                                    avg = 0.0
+                                if not sym or abs(qty) <= 0:
+                                    continue
+                                side = "long" if qty > 0 else "short"
+                                exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = abs(qty)
+                                if avg > 0:
+                                    exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = avg
+                        # Continue to reconciliation logic below
+
+                    elif AlpacaClient is not None and isinstance(client, AlpacaClient):
+                        # Alpaca positions cover both US stocks and crypto. The client
+                        # already returns a normalized `side` string ("long" / "short")
+                        # plus `quantity` and `avgCost`. Crypto symbols come through as
+                        # "BTC/USD" — same format the strategy stores, so no extra
+                        # normalization is needed here.
+                        try:
+                            positions = client.get_positions() or []
+                        except Exception as e:
+                            logger.error(f"[PositionSync] Strategy {sid} Alpaca get_positions failed: {e}", exc_info=True)
+                            continue
+                        if isinstance(positions, list):
+                            for p in positions:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol") or "").strip()
+                                try:
+                                    qty = float(p.get("quantity") or 0.0)
+                                except Exception:
+                                    qty = 0.0
+                                try:
+                                    avg = float(p.get("avgCost") or 0.0)
+                                except Exception:
+                                    avg = 0.0
+                                if not sym or abs(qty) <= 0:
+                                    continue
+                                side_str = str(p.get("side") or "").strip().lower()
+                                if side_str not in ("long", "short"):
+                                    side_str = "long" if qty > 0 else "short"
+                                exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side_str] = abs(qty)
+                                if avg > 0:
+                                    exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side_str] = avg
+                        # Continue to reconciliation logic below
+
+                    else:
+                        # Spot reconciliation is optional; skip for now (keeps self-check low-risk).
+                        logger.debug(f"position sync: skip unsupported market/client: sid={sid}, cfg={safe_cfg}, market_type={market_type}, client={type(client)}")
+                        continue
+
+                    _set_position_sync_snapshot(cache_key, exch_size, exch_entry_price)
 
                 # [DEBUG] Log all normalized exchange keys for inspection
                 logger.debug(f"[PositionSync] Strategy {sid} Exchange Keys: {list(exch_size.keys())}")
 
-                # [Log Optimization] Always log current positions every sync cycle (10s)
+                # [Log Optimization] Log current positions each sync cycle (see POSITION_SYNC_INTERVAL_SEC)
                 pos_summary_parts = []
                 for _sym, _sides in exch_size.items():
                     for _side_key, _qty in _sides.items():
@@ -638,7 +888,12 @@ class PendingOrderWorker:
                 if to_insert:
                     logger.debug(f"position sync: inserted {len(to_insert)} new positions for strategy_id={sid}")
             except Exception as e:
-                logger.error(f"position sync: strategy_id={sid} failed: {e}", exc_info=True)
+                msg = str(e)
+                if is_fatal_exchange_error(msg):
+                    logger.error(f"[PositionSync] Strategy {sid} fatal error; auto-stopping. error={msg}", exc_info=True)
+                    auto_stop_live_strategy(int(sid), msg, source="position_sync")
+                else:
+                    logger.error(f"position sync: strategy_id={sid} failed: {e}", exc_info=True)
 
     def _fetch_pending_orders(self, limit: int = 50) -> List[Dict[str, Any]]:
         try:
@@ -769,45 +1024,6 @@ class PendingOrderWorker:
                 extra={"pending_order_id": order_id, "mode": mode},
             )
 
-            # Broadcast signal via WebSocket to local trade executors
-            try:
-                from app.services.websocket_signal import get_signal_hub, get_background_loop
-                hub = get_signal_hub()
-
-                sid = int(strategy_id or 0)
-                ws_user_id = None
-                if sid > 0:
-                    try:
-                        sc = load_strategy_configs(sid)
-                        ws_user_id = int(sc.get("user_id") or 1)
-                    except Exception:
-                        pass
-
-                ws_signal = {
-                    "strategy_id": sid,
-                    "strategy_name": str(strategy_name or ""),
-                    "symbol": str(symbol or ""),
-                    "signal_type": str(signal_type or ""),
-                    "price": float(price or 0.0),
-                    "stake_amount": float(amount or 0.0),
-                    "direction": str(direction or "long"),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "pending_order_id": order_id,
-                    "execution_mode": mode,
-                    "notification_results": {
-                        c: {"ok": (r or {}).get("ok", False), "error": (r or {}).get("error", "")}
-                        for c, r in results.items()
-                    },
-                }
-
-                asyncio.run_coroutine_threadsafe(
-                    hub.broadcast_signal(ws_signal, target_user_id=ws_user_id),
-                    get_background_loop()
-                )
-                logger.debug(f"Signal broadcasted via WebSocket: {signal_type} {symbol}")
-            except Exception as ws_error:
-                logger.warning(f"WebSocket broadcast failed (non-critical): {ws_error}")
-
             attempted = list(results.keys())
             ok_channels = [c for c, r in results.items() if (r or {}).get("ok")]
             fail_channels = [c for c, r in results.items() if not (r or {}).get("ok")]
@@ -875,153 +1091,6 @@ class PendingOrderWorker:
             return str(row.get("strategy_name") or "").strip()
         except Exception:
             return ""
-
-    def _push_signal_to_local_client(
-        self,
-        *,
-        order_id: int,
-        order_row: Dict[str, Any],
-        payload: Dict[str, Any],
-        strategy_id: int,
-        exchange_id: str,
-        market_category: str,
-        _notify_live_best_effort,
-        _console_print,
-    ) -> None:
-        """
-        Push MT5/IBKR signal to local client via WebSocket.
-        
-        Two-phase operation:
-        Phase 1: Mark order as 'signal_pushed' (waiting for local execution)
-        Phase 2: Local client executes and reports back via API (not implemented yet)
-        
-        Retry mechanism:
-        - If WebSocket push fails, retry up to MAX_RETRY times with exponential backoff
-        - If timeout (no response from local client), mark as failed
-        """
-        MAX_RETRY = 3
-        RETRY_DELAY_BASE = 2  # seconds
-        
-        signal_type = payload.get("signal_type") or order_row.get("signal_type")
-        symbol = payload.get("symbol") or order_row.get("symbol")
-        amount = float(payload.get("amount") or order_row.get("amount") or 0.0)
-        price = float(payload.get("price") or order_row.get("ref_price") or 0.0)
-        
-        _console_print(f"[worker] Pushing {exchange_id} signal to local client: strategy_id={strategy_id} pending_id={order_id}")
-        
-        # Prepare signal data
-        signal_data = {
-            'type': 'trading_signal',
-            'strategy_id': strategy_id,
-            'symbol': symbol,
-            'signal_type': signal_type,
-            'amount': amount,
-            'price': price,
-            'market_category': market_category,
-            'exchange_id': exchange_id,
-            'pending_order_id': order_id,
-            'timestamp': int(time.time()),
-            'retry_count': 0,  # Will be incremented on retry
-        }
-        
-        # Get user_id for this strategy
-        try:
-            cfg = load_strategy_configs(strategy_id)
-            user_id = int(cfg.get("user_id") or 1)
-        except Exception as e:
-            logger.error(f"Failed to get user_id for strategy {strategy_id}: {e}")
-            self._mark_failed(order_id=order_id, error=f"get_user_id_failed:{e}")
-            _notify_live_best_effort(status="failed", error=f"get_user_id_failed:{e}")
-            return
-        
-        # Try to push signal via WebSocket with retry
-        success = False
-        last_error = None
-        
-        for attempt in range(1, MAX_RETRY + 1):
-            try:
-                from app.services.websocket_signal import get_signal_hub, get_background_loop
-                hub = get_signal_hub()
-                bg_loop = get_background_loop()
-                
-                # Check if there are any connected clients for this user
-                active_clients = sum(
-                    1 for meta in hub.client_metadata.values()
-                    if meta.get('user_id') == user_id
-                )
-                
-                if active_clients == 0:
-                    logger.warning(
-                        f"No active local clients for user {user_id}, "
-                        f"signal will wait until client connects (attempt {attempt}/{MAX_RETRY})"
-                    )
-                    last_error = "no_active_clients"
-                    
-                    # Wait before retry (exponential backoff)
-                    if attempt < MAX_RETRY:
-                        wait_time = RETRY_DELAY_BASE * (2 ** (attempt - 1))
-                        time.sleep(wait_time)
-                    continue
-                
-                # Broadcast signal to user's clients via background loop
-                asyncio.run_coroutine_threadsafe(
-                    hub.broadcast_signal(signal_data, target_user_id=user_id),
-                    bg_loop
-                )
-                
-                success = True
-                logger.info(
-                    f"Signal pushed successfully: user={user_id} exchange={exchange_id} "
-                    f"pending_id={order_id} clients={active_clients}"
-                )
-                break
-                
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(
-                    f"Failed to push signal (attempt {attempt}/{MAX_RETRY}): {e}"
-                )
-                
-                # Wait before retry (exponential backoff)
-                if attempt < MAX_RETRY:
-                    wait_time = RETRY_DELAY_BASE * (2 ** (attempt - 1))
-                    time.sleep(wait_time)
-        
-        if success:
-            # Phase 1: Mark order as 'signal_pushed' (waiting for local execution)
-            self._mark_sent(
-                order_id=order_id,
-                note=f"signal_pushed_to_local_client_{exchange_id}",
-                exchange_id=exchange_id,
-                exchange_order_id="",
-                exchange_response_json=json.dumps({
-                    'status': 'pushed',
-                    'message': 'Signal sent to local client, waiting for execution report'
-                }, ensure_ascii=False),
-                filled=0.0,
-                avg_price=price,
-                executed_at=int(time.time()),
-            )
-            _console_print(
-                f"[worker] Signal pushed: strategy_id={strategy_id} pending_id={order_id} "
-                f"exchange={exchange_id} status=waiting_for_local_execution"
-            )
-            _notify_live_best_effort(
-                status="pushed",
-                exchange_id=exchange_id,
-                error="",
-            )
-            append_strategy_log(
-                strategy_id, "info",
-                f"Signal pushed to local client: {signal_type} {symbol} amount={amount} (exchange={exchange_id})"
-            )
-        else:
-            # All retries failed
-            error_msg = f"signal_push_failed_after_{MAX_RETRY}_retries:{last_error}"
-            self._mark_failed(order_id=order_id, error=error_msg)
-            _console_print(f"[worker] Signal push failed: strategy_id={strategy_id} pending_id={order_id} err={last_error}")
-            _notify_live_best_effort(status="failed", error=error_msg)
-            append_strategy_log(strategy_id, "error", f"Failed to push signal to local client: {last_error}")
 
     def _execute_live_order(self, *, order_id: int, order_row: Dict[str, Any], payload: Dict[str, Any]) -> None:
         """
@@ -1118,39 +1187,42 @@ class PendingOrderWorker:
         exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
         market_category = str(cfg.get("market_category") or "Crypto").strip()
 
-        # Validate market category and exchange_id combination for live trading
-        # Futures does not support live trading
-        if market_category in ("Futures",):
-            self._mark_failed(order_id=order_id, error=f"live_trading_not_supported_for_{market_category.lower()}")
-            _console_print(f"[worker] order rejected: strategy_id={strategy_id} pending_id={order_id} {market_category} does not support live trading")
-            _notify_live_best_effort(status="failed", error=f"live_trading_not_supported_for_{market_category.lower()}")
-            append_strategy_log(strategy_id, "error", f"Order rejected: {market_category} does not support live trading")
+        # Pre-resolve market_type / trade_direction / bot_type so we can hand
+        # them to the centralized policy validator. Reading these here also
+        # lets the validator catch e.g. "alpaca + crypto + market_type=swap"
+        # instead of waiting for the broker to reject the order.
+        _pre_market_type = (
+            payload.get("market_type")
+            or order_row.get("market_type")
+            or cfg.get("market_type")
+            or exchange_config.get("market_type")
+            or "swap"
+        )
+        _pre_trading_cfg = cfg.get("trading_config") or {}
+        _pre_trade_direction = _pre_trading_cfg.get("trade_direction")
+        _pre_bot_type = _pre_trading_cfg.get("bot_type")
+
+        # Centralized validation: broker x market x market_type x direction x
+        # bot_type. Same call site that strategy CRUD uses, so an order can
+        # only fail here if the strategy was somehow created before the
+        # policy was tightened, or if the cfg drifted out of sync.
+        from app.services.broker_market_policy import validate_strategy_config
+        try:
+            validate_strategy_config(
+                exchange_id=exchange_id,
+                market_category=market_category,
+                market_type=_pre_market_type,
+                trade_direction=_pre_trade_direction,
+                bot_type=_pre_bot_type,
+                require_exchange=True,
+            )
+        except ValueError as e:
+            err = f"policy_violation:{e}"
+            self._mark_failed(order_id=order_id, error=err)
+            _console_print(f"[worker] order rejected by policy: strategy_id={strategy_id} pending_id={order_id} err={e}")
+            _notify_live_best_effort(status="failed", error=err)
+            append_strategy_log(strategy_id, "error", f"Order rejected: {e}")
             return
-
-        # Validate IBKR only for USStock
-        if exchange_id == "ibkr":
-            if market_category not in ("USStock",):
-                self._mark_failed(order_id=order_id, error=f"ibkr_only_supports_usstock_got_{market_category.lower()}")
-                _console_print(f"[worker] order rejected: strategy_id={strategy_id} pending_id={order_id} IBKR only supports USStock, got {market_category}")
-                _notify_live_best_effort(status="failed", error=f"ibkr_only_supports_usstock_got_{market_category.lower()}")
-                return
-
-        # Validate MT5 only for Forex
-        if exchange_id == "mt5":
-            if market_category != "Forex":
-                self._mark_failed(order_id=order_id, error=f"mt5_only_supports_forex_got_{market_category.lower()}")
-                _console_print(f"[worker] order rejected: strategy_id={strategy_id} pending_id={order_id} MT5 only supports Forex, got {market_category}")
-                _notify_live_best_effort(status="failed", error=f"mt5_only_supports_forex_got_{market_category.lower()}")
-                return
-
-        # Validate crypto exchanges only for Crypto market
-        crypto_exchanges = ["binance", "okx", "bitget", "bybit", "coinbaseexchange", "kraken", "kucoin", "gate"]
-        if exchange_id in crypto_exchanges:
-            if market_category != "Crypto":
-                self._mark_failed(order_id=order_id, error=f"crypto_exchange_only_supports_crypto_got_{market_category.lower()}")
-                _console_print(f"[worker] order rejected: strategy_id={strategy_id} pending_id={order_id} {exchange_id} only supports Crypto, got {market_category}")
-                _notify_live_best_effort(status="failed", error=f"crypto_exchange_only_supports_crypto_got_{market_category.lower()}")
-                return
 
         market_type = (payload.get("market_type") or order_row.get("market_type") or cfg.get("market_type") or exchange_config.get("market_type") or "swap")
         market_type = str(market_type or "swap").strip().lower()
@@ -1167,7 +1239,7 @@ class PendingOrderWorker:
             append_strategy_log(strategy_id, "error", f"Exchange client creation failed ({exchange_id}): {e}")
             return
 
-        # Check if this is an IBKR client (US stocks) - Push to local client instead of executing in cloud
+        # Check if this is an IBKR client (US stocks)
         global IBKRClient
         if IBKRClient is None:
             try:
@@ -1177,20 +1249,20 @@ class PendingOrderWorker:
                 pass
 
         if IBKRClient is not None and isinstance(client, IBKRClient):
-            # IBKR orders must be executed by local client, push signal via WebSocket
-            self._push_signal_to_local_client(
+            # Execute IBKR order (separate flow for stocks)
+            self._execute_ibkr_order(
                 order_id=order_id,
                 order_row=order_row,
                 payload=payload,
+                client=client,
                 strategy_id=strategy_id,
-                exchange_id="ibkr",
-                market_category=market_category,
+                exchange_config=exchange_config,
                 _notify_live_best_effort=_notify_live_best_effort,
                 _console_print=_console_print,
             )
             return
 
-        # Check if this is an MT5 client (Forex) - Push to local client instead of executing in cloud
+        # Check if this is an MT5 client (Forex)
         global MT5Client
         if MT5Client is None:
             try:
@@ -1200,13 +1272,36 @@ class PendingOrderWorker:
                 pass
 
         if MT5Client is not None and isinstance(client, MT5Client):
-            # MT5 orders must be executed by local client, push signal via WebSocket
-            self._push_signal_to_local_client(
+            # Execute MT5 order (separate flow for forex)
+            self._execute_mt5_order(
                 order_id=order_id,
                 order_row=order_row,
                 payload=payload,
+                client=client,
                 strategy_id=strategy_id,
-                exchange_id="mt5",
+                exchange_config=exchange_config,
+                _notify_live_best_effort=_notify_live_best_effort,
+                _console_print=_console_print,
+            )
+            return
+
+        # Check if this is an Alpaca client (US stocks + crypto via REST)
+        global AlpacaClient
+        if AlpacaClient is None:
+            try:
+                from app.services.alpaca_trading import AlpacaClient as _AlpacaClient
+                AlpacaClient = _AlpacaClient
+            except ImportError:
+                pass
+
+        if AlpacaClient is not None and isinstance(client, AlpacaClient):
+            self._execute_alpaca_order(
+                order_id=order_id,
+                order_row=order_row,
+                payload=payload,
+                client=client,
+                strategy_id=strategy_id,
+                exchange_config=exchange_config,
                 market_category=market_category,
                 _notify_live_best_effort=_notify_live_best_effort,
                 _console_print=_console_print,
@@ -1386,23 +1481,6 @@ class PendingOrderWorker:
                 if (not fee_ccy) and ccy:
                     fee_ccy = str(ccy or "")
 
-        def _fetch_fee_best_effort(*, order_id0: str, client_order_id0: str) -> Tuple[float, str]:
-            """
-            Some exchanges (notably Binance) do not expose commissions on order endpoints.
-            We fetch fills and sum commissions best-effort.
-            """
-            oid = str(order_id0 or "").strip()
-            if not oid:
-                return 0.0, ""
-            try:
-                if isinstance(client, BinanceFuturesClient):
-                    return client.get_fee_for_order(symbol=str(symbol), order_id=oid)
-                if isinstance(client, BinanceSpotClient):
-                    return client.get_fee_for_order(symbol=str(symbol), order_id=oid)
-            except Exception:
-                return 0.0, ""
-            return 0.0, ""
-
         def _current_avg() -> float:
             return float(total_quote / total_base) if total_base > 0 else 0.0
 
@@ -1498,6 +1576,23 @@ class PendingOrderWorker:
                 # Best-effort only; log and continue with original amount
                 logger.warning(f"Failed to query position for close adjustment: pending_id={order_id}, err={e}")
                 phases["pos_query_error"] = str(e)
+
+        # Spot close: cap to exchange free base (fees often make DB size > sellable free).
+        if reduce_only and market_type == "spot" and side == "sell":
+            try:
+                from app.services.live_trading.spot_sizing import clamp_spot_close_quantity
+
+                new_amt, spot_meta = clamp_spot_close_quantity(
+                    client, symbol=str(symbol), requested_qty=float(amount or 0.0)
+                )
+                if spot_meta.get("adjusted"):
+                    phases["spot_close_adjustment"] = spot_meta
+                amount = new_amt
+            except Exception as e:
+                logger.warning(
+                    "Spot close amount adjustment failed: pending_id=%s, err=%s", order_id, e
+                )
+                phases["spot_close_adjust_error"] = str(e)
 
         # Decide if we should use limit-first flow.
         use_limit_first = order_mode in ("maker", "limit", "limit_first", "maker_then_market")
@@ -2211,9 +2306,11 @@ class PendingOrderWorker:
                     filled=filled,
                     avg_price=avg_price,
                 )
-                # Best-effort: subtract commission from profit if fee is in USDT/USDC/USD.
-                if profit is not None and total_fee > 0 and str(fee_ccy or "").upper() in ("USDT", "USDC", "USD"):
-                    profit = float(profit) - float(total_fee)
+                # ``profit`` = trade P&L from position math (gross).
+                # ``commission`` = fee synced from the exchange fill (see
+                # ``total_fee`` above). Net realised P&L is always
+                # ``profit - commission`` at read/aggregate time — do not
+                # pre-subtract here or dashboards double-count the fee.
                 record_trade(
                     strategy_id=strategy_id,
                     symbol=str(symbol),
@@ -2403,6 +2500,146 @@ class PendingOrderWorker:
             _console_print(f"[worker] IBKR order exception: strategy_id={strategy_id} pending_id={order_id} err={e}")
             _notify_live_best_effort(status="failed", error=str(e))
             append_strategy_log(strategy_id, "error", f"IBKR order exception ({symbol} {signal_type}): {e}")
+            if is_fatal_exchange_error(str(e)):
+                auto_stop_live_strategy(int(strategy_id), str(e), source="ibkr_order")
+
+    def _execute_alpaca_order(
+        self,
+        *,
+        order_id: int,
+        order_row: Dict[str, Any],
+        payload: Dict[str, Any],
+        client,  # AlpacaClient instance
+        strategy_id: int,
+        exchange_config: Dict[str, Any],
+        market_category: str,
+        _notify_live_best_effort,
+        _console_print,
+    ) -> None:
+        """
+        Execute order via Alpaca for US stocks (USStock) or crypto.
+
+        Mirrors `_execute_ibkr_order`: market order, brief poll for fill,
+        record trade, mark sent. Long-only — short signals are rejected.
+        """
+        signal_type = payload.get("signal_type") or order_row.get("signal_type")
+        symbol = payload.get("symbol") or order_row.get("symbol")
+        amount = float(payload.get("amount") or order_row.get("amount") or 0.0)
+        ref_price = float(payload.get("ref_price") or payload.get("price") or order_row.get("price") or 0.0)
+
+        sig = str(signal_type or "").strip().lower()
+
+        if "short" in sig:
+            self._mark_failed(order_id=order_id, error="alpaca_short_not_supported")
+            _console_print(f"[worker] Alpaca order rejected: strategy_id={strategy_id} pending_id={order_id} short not supported")
+            _notify_live_best_effort(status="failed", error="alpaca_short_not_supported")
+            return
+
+        if sig in ("open_long", "add_long"):
+            action = "buy"
+        elif sig in ("close_long", "reduce_long", "close_long_stop", "close_long_profit", "close_long_trailing"):
+            action = "sell"
+        else:
+            self._mark_failed(order_id=order_id, error=f"alpaca_unsupported_signal:{signal_type}")
+            _console_print(f"[worker] Alpaca order rejected: strategy_id={strategy_id} pending_id={order_id} unsupported signal {signal_type}")
+            _notify_live_best_effort(status="failed", error=f"alpaca_unsupported_signal:{signal_type}")
+            return
+
+        # Decide stock vs crypto leg of the Alpaca account based on the
+        # strategy's market_category (USStock by default).
+        mc = (market_category or "USStock").strip()
+        market_type_for_client = "crypto" if mc.lower() in ("crypto", "cryptocurrency") else "USStock"
+
+        try:
+            result = client.place_market_order(
+                symbol=symbol,
+                side=action,
+                quantity=amount,
+                market_type=market_type_for_client,
+            )
+
+            if not result.success:
+                self._mark_failed(order_id=order_id, error=f"alpaca_order_failed:{result.message}")
+                _console_print(f"[worker] Alpaca order failed: strategy_id={strategy_id} pending_id={order_id} err={result.message}")
+                _notify_live_best_effort(status="failed", error=f"alpaca_order_failed:{result.message}")
+                append_strategy_log(strategy_id, "error", f"Alpaca order failed ({symbol} {signal_type}): {result.message}")
+                return
+
+            filled = float(result.filled or 0.0)
+            avg_price = float(result.avg_price or 0.0)
+            exchange_order_id = str(result.order_id or "")
+
+            if avg_price <= 0 and ref_price > 0:
+                logger.warning(
+                    f"[worker] Alpaca order avg_price=0, using ref_price={ref_price} as fallback: "
+                    f"strategy_id={strategy_id} pending_id={order_id}"
+                )
+                avg_price = ref_price
+            if filled <= 0:
+                logger.warning(
+                    f"[worker] Alpaca order filled=0, using amount={amount} as fallback: "
+                    f"strategy_id={strategy_id} pending_id={order_id}"
+                )
+                filled = amount
+
+            executed_at = int(time.time())
+
+            self._mark_sent(
+                order_id=order_id,
+                note="alpaca_order_sent",
+                exchange_id="alpaca",
+                exchange_order_id=exchange_order_id,
+                exchange_response_json=json.dumps(result.raw or {}, ensure_ascii=False),
+                filled=filled,
+                avg_price=avg_price,
+                executed_at=executed_at,
+            )
+            _console_print(
+                f"[worker] Alpaca order sent: strategy_id={strategy_id} pending_id={order_id} "
+                f"order_id={exchange_order_id} filled={filled} avg={avg_price}"
+            )
+
+            try:
+                if filled > 0 and avg_price > 0:
+                    profit, _pos = apply_fill_to_local_position(
+                        strategy_id=strategy_id,
+                        symbol=str(symbol),
+                        signal_type=str(signal_type),
+                        filled=filled,
+                        avg_price=avg_price,
+                    )
+                    record_trade(
+                        strategy_id=strategy_id,
+                        symbol=str(symbol),
+                        trade_type=str(signal_type),
+                        price=avg_price,
+                        amount=filled,
+                        commission=0.0,  # Alpaca commissions are zero on stocks; crypto has fees in raw
+                        commission_ccy="USD",
+                        profit=profit,
+                    )
+                    _pstr = f", profit={profit:.4f}" if profit is not None else ""
+                    append_strategy_log(
+                        strategy_id, "trade",
+                        f"Trade executed: {signal_type} {symbol} filled={filled:.6f} @ {avg_price:.6f}{_pstr} (exchange=alpaca)",
+                    )
+            except Exception as e:
+                logger.warning(f"Alpaca record_trade/update_position failed: pending_id={order_id}, err={e}")
+
+            _notify_live_best_effort(
+                status="sent",
+                exchange_id="alpaca",
+                exchange_order_id=exchange_order_id,
+                price_hint=avg_price,
+                amount_hint=filled,
+            )
+
+        except Exception as e:
+            logger.error(f"Alpaca order execution failed: pending_id={order_id}, strategy_id={strategy_id}, err={e}")
+            self._mark_failed(order_id=order_id, error=f"alpaca_exception:{e}")
+            _console_print(f"[worker] Alpaca order exception: strategy_id={strategy_id} pending_id={order_id} err={e}")
+            _notify_live_best_effort(status="failed", error=str(e))
+            append_strategy_log(strategy_id, "error", f"Alpaca order exception ({symbol} {signal_type}): {e}")
 
     def _execute_mt5_order(
         self,

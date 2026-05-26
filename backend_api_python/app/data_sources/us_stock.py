@@ -1,12 +1,9 @@
 """
 美股数据源
-使用 Twelve Data、yfinance 和 finnhub 获取数据
-优先级：Finnhub → Twelve Data → yfinance
+使用 yfinance 和 finnhub 获取数据
 """
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
-import os
-import requests
 
 import yfinance as yf
 
@@ -17,140 +14,10 @@ from app.config import APIKeys, YFinanceConfig
 logger = get_logger(__name__)
 
 
-def _configure_yfinance_proxy():
-    """配置yfinance使用代理（通过环境变量）"""
-    proxy_url = os.getenv('PROXY_URL', '').strip()
-    if proxy_url:
-        # yfinance内部使用requests，会自动读取HTTP_PROXY/HTTPS_PROXY环境变量
-        if '://' in proxy_url:
-            os.environ['HTTPS_PROXY'] = proxy_url
-            os.environ['HTTP_PROXY'] = proxy_url
-            logger.debug(f"yfinance proxy configured: {proxy_url}")
-
-
-def _get_twelve_data_api_key() -> str:
-    """获取 Twelve Data API Key"""
-    return (os.getenv('TWELVE_DATA_API_KEY') or '').strip()
-
-
-def _fetch_twelvedata_kline(
-    symbol: str,
-    interval: str,
-    limit: int,
-    before_time: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """
-    使用 Twelve Data API 获取美股K线数据
-    
-    Args:
-        symbol: 股票代码 (如 AAPL, XAUUSD)
-        interval: 时间周期 (1min, 5min, 1h, 1day, 1week)
-        limit: 返回条数
-        before_time: 结束时间戳（可选）
-    
-    Returns:
-        K线数据列表
-    """
-    api_key = _get_twelve_data_api_key()
-    if not api_key:
-        return []
-    
-    # Twelve Data 美股符号映射
-    td_symbol = symbol.upper()
-    
-    # 构建请求参数
-    params = {
-        'symbol': td_symbol,
-        'interval': interval,
-        'outputsize': min(limit, 5000),  # Twelve Data 最大5000条
-        'apikey': api_key,
-        'format': 'JSON',
-        'dp': '4',  # 小数位数
-    }
-    
-    # 如果指定了结束时间
-    if before_time:
-        end_dt = datetime.fromtimestamp(int(before_time))
-        params['end_date'] = end_dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    try:
-        logger.info(f"Fetching from Twelve Data: {td_symbol} {interval} limit={limit}")
-        resp = requests.get(
-            'https://api.twelvedata.com/time_series',
-            params=params,
-            timeout=10  # 10秒超时
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        
-        logger.debug(f"Twelve Data response status: {data.get('status', 'ok')}")
-        
-        # 检查错误
-        if data.get('status') == 'error':
-            logger.warning(f"Twelve Data error for {symbol}: {data.get('message')}")
-            return []
-        
-        # 解析K线数据
-        klines = []
-        values = data.get('values', [])
-        logger.debug(f"Twelve Data returned {len(values)} values")
-        
-        for bar in values:
-            try:
-                # Twelve Data 返回的时间格式可能是:
-                # - 日线: "2024-01-15"
-                # - 分钟线: "2024-01-15 09:30:00"
-                dt_str = bar.get('datetime', '')
-                if not dt_str:
-                    logger.debug("Skipping bar with no datetime")
-                    continue
-                
-                # 解析时间（支持两种格式）
-                if ' ' in dt_str:
-                    # 有时间的格式: "2024-01-15 09:30:00"
-                    dt = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
-                else:
-                    # 只有日期的格式: "2024-01-15"
-                    dt = datetime.strptime(dt_str, '%Y-%m-%d')
-                
-                timestamp = int(dt.timestamp())
-                
-                klines.append({
-                    'time': timestamp,
-                    'open': float(bar.get('open', 0)),
-                    'high': float(bar.get('high', 0)),
-                    'low': float(bar.get('low', 0)),
-                    'close': float(bar.get('close', 0)),
-                    'volume': float(bar.get('volume', 0)),
-                })
-            except Exception as e:
-                logger.warning(f"Failed to parse Twelve Data bar: {e}, bar={bar}")
-                continue
-        
-        # Twelve Data 返回的是倒序（最新的在前），需要反转
-        klines.reverse()
-        
-        logger.info(f"Twelve Data fetched {len(klines)} bars for {symbol}")
-        return klines
-        
-    except requests.exceptions.Timeout:
-        logger.warning(f"Twelve Data timeout for {symbol}")
-        return []
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Twelve Data request failed for {symbol}: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Twelve Data unexpected error for {symbol}: {e}")
-        return []
-
-
 class USStockDataSource(BaseDataSource):
     """美股数据源"""
     
     name = "USStock/yfinance"
-    
-    # 已知的非美股符号（应该使用其他数据源）
-    NON_STOCK_SYMBOLS = {'XAUUSD', 'XAUEUR', 'XAGUSD', 'GOLD', 'SILVER'}
     
     # yfinance 时间周期映射
     INTERVAL_MAP = {
@@ -183,30 +50,7 @@ class USStockDataSource(BaseDataSource):
         '3m': 3,
     }
     
-    # Twelve Data 时间周期映射（支持大小写）
-    TD_INTERVAL_MAP = {
-        '1m': '1min',
-        '5m': '5min',
-        '15m': '15min',
-        '30m': '30min',
-        '1h': '1h',
-        '1H': '1h',
-        '4h': '4h',
-        '4H': '4h',
-        '1d': '1day',
-        '1D': '1day',
-        '1wk': '1week',
-        '1W': '1week'
-    }
-    
-    def _convert_to_td_interval(self, yf_interval: str) -> Optional[str]:
-        """将yfinance的时间周期转换为Twelve Data的格式"""
-        return self.TD_INTERVAL_MAP.get(yf_interval)
-    
     def __init__(self):
-        # 配置代理
-        _configure_yfinance_proxy()
-        
         # 初始化 finnhub 作为备选
         self.finnhub_client = None
         try:
@@ -235,11 +79,6 @@ class USStockDataSource(BaseDataSource):
             }
         """
         symbol = (symbol or '').strip().upper()
-        
-        # 快速跳过非美股符号
-        if symbol in self.NON_STOCK_SYMBOLS:
-            logger.debug(f"Skipping non-stock symbol {symbol} in USStock datasource")
-            return {'last': 0, 'symbol': symbol}
         
         # 优先使用 Finnhub（实时数据）
         if self.finnhub_client:
@@ -342,17 +181,8 @@ class USStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """获取美股K线数据
-        
-        优先级：Finnhub → Twelve Data → yfinance
-        """
+        """获取美股K线数据"""
         klines = []
-        
-        # 快速跳过非美股符号
-        symbol_upper = (symbol or '').strip().upper()
-        if symbol_upper in self.NON_STOCK_SYMBOLS:
-            logger.debug(f"Skipping non-stock symbol {symbol} in USStock datasource")
-            return klines
         
         try:
             interval = self.INTERVAL_MAP.get(timeframe, '1d')
@@ -372,42 +202,24 @@ class USStockDataSource(BaseDataSource):
                 floor = datetime.fromtimestamp(after_time)
                 start_date = min(start_date, floor)
             
-            # Tier 1: 尝试 Twelve Data（最快、最稳定）
-            td_interval = self._convert_to_td_interval(interval)
-            if td_interval:
-                klines = _fetch_twelvedata_kline(symbol, td_interval, effective_limit, before_time)
-                if klines:
-                    logger.info(f"Using Twelve Data for {symbol} {timeframe}")
-                    if merge_factor > 1:
-                        klines = self._merge_every_n_sorted_bars(klines, merge_factor)
-                    klines = self.filter_and_limit(
-                        klines,
-                        limit,
-                        before_time,
-                        after_time,
-                        truncate=(after_time is None),
-                    )
-                    self.log_result(symbol, klines, timeframe)
-                    return klines
+            # logger.info(f"使用 yfinance 获取 {symbol}, 周期: {interval}, 日期: {start_date.date()} ~ {end_date.date()}")
             
-            # Tier 2: 尝试 finnhub（仅日线）
-            if self.finnhub_client and timeframe == '1D':
-                klines = self._fetch_finnhub(symbol, start_date, end_date, limit)
-                if klines:
-                    logger.info(f"Using Finnhub for {symbol} {timeframe}")
-                    return self.filter_and_limit(
-                        klines,
-                        limit,
-                        before_time,
-                        after_time,
-                        truncate=(after_time is None),
-                    )
-            
-            # Tier 3: 降级使用 yfinance
-            logger.debug(f"Falling back to yfinance for {symbol} {timeframe}")
+            # 尝试 yfinance
             df = self._fetch_yfinance(symbol, interval, start_date, end_date)
             
-            if df is not None and not df.empty:
+            if df is None or df.empty:
+                # 尝试 finnhub
+                if self.finnhub_client and timeframe == '1D':
+                    klines = self._fetch_finnhub(symbol, start_date, end_date, limit)
+                    if klines:
+                        return self.filter_and_limit(
+                            klines,
+                            limit,
+                            before_time,
+                            after_time,
+                            truncate=(after_time is None),
+                        )
+            else:
                 klines = self._convert_dataframe(df, effective_limit)
                 if merge_factor > 1:
                     klines = self._merge_every_n_sorted_bars(klines, merge_factor)
@@ -434,9 +246,6 @@ class USStockDataSource(BaseDataSource):
     def _fetch_yfinance(self, symbol: str, interval: str, start_date: datetime, end_date: datetime):
         """使用 yfinance 获取数据"""
         try:
-            # 配置超时时间（从环境变量读取，默认10秒）
-            timeout = int(os.getenv('YFINANCE_TIMEOUT', '10'))
-            
             ticker = yf.Ticker(symbol)
             
             # yfinance 的 end 参数是不包含的（exclusive），所以需要加一天才能包含 end_date 当天的数据
@@ -451,12 +260,7 @@ class USStockDataSource(BaseDataSource):
             # logger.info(f"yfinance 返回 {len(df) if df is not None and not df.empty else 0} 条数据")
             return df
         except Exception as e:
-            error_msg = str(e).lower()
-            # 如果是限流错误，快速失败
-            if 'too many requests' in error_msg or 'rate limit' in error_msg:
-                logger.warning(f"yfinance rate limited for {symbol}: {e}")
-            else:
-                logger.warning(f"yfinance fetch failed: {e}")
+            logger.warning(f"yfinance fetch failed: {e}")
             return None
 
     def _merge_every_n_sorted_bars(self, bars: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:

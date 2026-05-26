@@ -373,9 +373,10 @@ def set_user_vip():
         
         if success:
             return jsonify({
-                'code': 1, 
-                'msg': 'VIP status updated successfully', 
-                'data': {'vip_expires_at': expires_at.isoformat() if expires_at else None}
+                'code': 1,
+                'msg': 'VIP status updated successfully',
+                # Let SafeJSONProvider normalize datetimes to UTC ISO (with Z).
+                'data': {'vip_expires_at': expires_at if expires_at else None}
             })
         else:
             return jsonify({'code': 0, 'msg': result, 'data': None}), 400
@@ -614,7 +615,8 @@ def get_my_referrals():
                     'username': row['username'],
                     'nickname': row['nickname'],
                     'avatar': row['avatar'],
-                    'created_at': row['created_at'].isoformat() if row['created_at'] else None
+                    # SafeJSONProvider serializes datetimes as UTC ISO.
+                    'created_at': row['created_at']
                 })
         
         return jsonify({
@@ -724,6 +726,12 @@ def update_notification_settings():
             default_channels = ['browser']
         
         # Build settings object
+        #
+        # webhook_signing_secret is optional and only meaningful for
+        # specific dialects (Feishu in-body sign / DingTalk URL sign).
+        # Generic self-hosted webhooks can use it for HMAC header
+        # signing — see signal_notifier._notify_webhook for the full
+        # semantics.
         settings = {
             'default_channels': default_channels,
             'telegram_bot_token': str(data.get('telegram_bot_token') or '').strip(),
@@ -732,6 +740,7 @@ def update_notification_settings():
             'discord_webhook': str(data.get('discord_webhook') or '').strip(),
             'webhook_url': str(data.get('webhook_url') or '').strip(),
             'webhook_token': str(data.get('webhook_token') or '').strip(),
+            'webhook_signing_secret': str(data.get('webhook_signing_secret') or '').strip(),
             'phone': str(data.get('phone') or '').strip(),
         }
         
@@ -991,6 +1000,7 @@ def test_notification_settings():
             'discord': (settings.get('discord_webhook') or '').strip(),
             'webhook': (settings.get('webhook_url') or '').strip(),
             'webhook_token': (settings.get('webhook_token') or '').strip(),
+            'webhook_signing_secret': (settings.get('webhook_signing_secret') or '').strip(),
         }
 
         accept = (request.headers.get('Accept-Language') or '') + ' ' + (request.headers.get('X-Locale') or '')
@@ -1113,6 +1123,81 @@ def _safe_json_loads(s, default=None):
         return default
 
 
+def _strategy_exchange_display_name(
+    exchange_config: dict,
+    *,
+    credential_map: dict,
+    user_id: int = 0,
+) -> str:
+    """Resolve exchange label for admin strategy lists.
+
+    Strategies often persist ``exchange_config`` as ``{credential_id: N}`` only
+  (API secrets live in ``qd_exchange_credentials``).  Read inline ``exchange_id``
+    first, then the credential row's ``exchange_id``, then ``resolve_exchange_config``
+    as a last resort.
+    """
+    if not isinstance(exchange_config, dict):
+        return ''
+
+    direct = (
+        exchange_config.get('exchange_id')
+        or exchange_config.get('exchange')
+        or exchange_config.get('broker')
+        or ''
+    )
+    direct = str(direct or '').strip()
+    if direct:
+        return direct
+
+    cred_id = exchange_config.get('credential_id') or exchange_config.get('credentials_id')
+    if cred_id:
+        try:
+            row = credential_map.get(int(cred_id))
+        except (TypeError, ValueError):
+            row = None
+        if row:
+            ex = str(row.get('exchange_id') or '').strip()
+            if ex:
+                return ex
+
+        try:
+            from app.services.exchange_execution import resolve_exchange_config
+
+            resolved = resolve_exchange_config(exchange_config, user_id=int(user_id or 1))
+            ex = str(resolved.get('exchange_id') or resolved.get('exchange') or '').strip()
+            if ex:
+                return ex
+        except Exception:
+            pass
+
+    return ''
+
+
+def _batch_load_credential_exchange_map(credential_ids: set) -> dict:
+    """Map credential id -> {id, exchange_id, name} for display (no decrypt)."""
+    if not credential_ids:
+        return {}
+    ids = sorted({int(i) for i in credential_ids if i})
+    if not ids:
+        return {}
+    placeholders = ','.join(['?'] * len(ids))
+    credential_map = {}
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            SELECT id, exchange_id, name
+            FROM qd_exchange_credentials
+            WHERE id IN ({placeholders})
+            """,
+            tuple(ids),
+        )
+        for row in (cur.fetchall() or []):
+            credential_map[int(row['id'])] = dict(row)
+        cur.close()
+    return credential_map
+
+
 @user_bp.route('/system-strategies', methods=['GET'])
 @login_required
 @admin_required
@@ -1157,7 +1242,7 @@ def get_system_strategies():
         sort_expr_map = {
             'total_pnl': (
                 "(COALESCE((SELECT SUM(unrealized_pnl) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0)"
-                " + COALESCE((SELECT SUM(profit) FROM qd_strategy_trades t WHERE t.strategy_id = s.id), 0))"
+                " + COALESCE((SELECT SUM(COALESCE(t.profit, 0) - COALESCE(t.commission, 0)) FROM qd_strategy_trades t WHERE t.strategy_id = s.id), 0))"
             ),
             'trade_count': '(SELECT COUNT(*) FROM qd_strategy_trades t WHERE t.strategy_id = s.id)',
             'position_count': '(SELECT COUNT(*) FROM qd_strategy_positions p WHERE p.strategy_id = s.id)',
@@ -1274,7 +1359,7 @@ def get_system_strategies():
                     f"""
                     SELECT strategy_id, 
                            COUNT(*) as trade_count, 
-                           COALESCE(SUM(profit), 0) as total_realized_pnl
+                           COALESCE(SUM(COALESCE(profit, 0) - COALESCE(commission, 0)), 0) as total_realized_pnl
                     FROM qd_strategy_trades
                     WHERE strategy_id IN ({placeholders})
                     GROUP BY strategy_id
@@ -1289,7 +1374,18 @@ def get_system_strategies():
 
             cur.close()
 
-        # Build response
+        # Build response — batch-resolve exchange names for credential_id-only configs.
+        cred_ids = set()
+        for s in strategies:
+            ec = _safe_json_loads(s.get('exchange_config'), {})
+            cid = ec.get('credential_id') or ec.get('credentials_id')
+            if cid:
+                try:
+                    cred_ids.add(int(cid))
+                except (TypeError, ValueError):
+                    pass
+        credential_map = _batch_load_credential_exchange_map(cred_ids)
+
         items = []
         for s in strategies:
             sid = s['id']
@@ -1312,10 +1408,12 @@ def get_system_strategies():
                 else:
                     indicator_name = s.get('strategy_name') or ''
 
-            # Extract exchange name
-            exchange_name = ''
-            if isinstance(exchange_config, dict):
-                exchange_name = exchange_config.get('exchange_id') or exchange_config.get('exchange') or ''
+            # Extract exchange name (inline config or saved credential reference).
+            exchange_name = _strategy_exchange_display_name(
+                exchange_config,
+                credential_map=credential_map,
+                user_id=int(s.get('user_id') or 0),
+            )
 
             # Positions data
             positions = positions_map.get(sid, [])
@@ -1340,18 +1438,10 @@ def get_system_strategies():
                 cs_type = trading_config.get('cs_strategy_type') or 'single'
                 symbol_list = trading_config.get('symbol_list') or []
 
-            # Format timestamps
+            # Timestamps are emitted as UTC ISO by SafeJSONProvider — pass
+            # datetime objects straight through.
             created_at = s.get('created_at')
             updated_at = s.get('updated_at')
-            if hasattr(created_at, 'isoformat'):
-                created_at = created_at.isoformat()
-            if hasattr(updated_at, 'isoformat'):
-                updated_at = updated_at.isoformat()
-
-            # Format position timestamps
-            for p in positions:
-                if hasattr(p.get('updated_at'), 'isoformat'):
-                    p['updated_at'] = p['updated_at'].isoformat()
 
             items.append({
                 'id': sid,
@@ -1423,9 +1513,9 @@ def get_system_strategies():
 
             # Aggregate realized pnl from trade history.
             realized_sql = f"""
-                SELECT COALESCE(SUM(t.profit), 0) AS total_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN t.profit ELSE 0 END), 0) AS live_realized,
-                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN t.profit ELSE 0 END), 0) AS signal_realized
+                SELECT COALESCE(SUM(COALESCE(t.profit, 0) - COALESCE(t.commission, 0)), 0) AS total_realized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN COALESCE(t.profit, 0) - COALESCE(t.commission, 0) ELSE 0 END), 0) AS live_realized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN COALESCE(t.profit, 0) - COALESCE(t.commission, 0) ELSE 0 END), 0) AS signal_realized
                 FROM qd_strategy_trades t
                 JOIN qd_strategies_trading s ON s.id = t.strategy_id
                 LEFT JOIN qd_users u ON u.id = s.user_id
@@ -1475,6 +1565,32 @@ def get_system_strategies():
 
 # ==================== Admin Orders ====================
 
+
+def _ensure_usdt_admin_columns():
+    """Best-effort: extend qd_usdt_orders with admin-audit columns introduced
+    by the manual-confirm flow. ``ADD COLUMN IF NOT EXISTS`` is idempotent
+    on PostgreSQL, so this is effectively a no-op after the first hit.
+
+    Failures are swallowed (logged at debug level) so a running DB user
+    without DDL privileges doesn't block the read paths — the SELECTs
+    further down use ``information_schema`` checks or COALESCE to tolerate
+    the columns being absent.
+    """
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "ALTER TABLE qd_usdt_orders ADD COLUMN IF NOT EXISTS admin_note TEXT DEFAULT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE qd_usdt_orders ADD COLUMN IF NOT EXISTS manual_confirmed_by INTEGER DEFAULT NULL"
+            )
+            db.commit()
+            cur.close()
+    except Exception as exc:
+        logger.debug("ensure_usdt_admin_columns skipped: %s", exc)
+
+
 @user_bp.route('/admin-orders', methods=['GET'])
 @login_required
 @admin_required
@@ -1496,6 +1612,8 @@ def get_admin_orders():
         search = request.args.get('search', '', type=str).strip()
         page_size = min(100, max(1, page_size))
         offset = (page - 1) * page_size
+
+        _ensure_usdt_admin_columns()
 
         with get_db_connection() as db:
             cur = db.cursor()
@@ -1537,6 +1655,9 @@ def get_admin_orders():
                     o.address,
                     o.tx_hash,
                     o.status,
+                    o.matched_via,
+                    o.admin_note,
+                    o.manual_confirmed_by,
                     o.created_at,
                     o.paid_at,
                     o.confirmed_at,
@@ -1567,18 +1688,12 @@ def get_admin_orders():
 
         items = []
         for row in rows:
+            # SafeJSONProvider normalizes datetimes to UTC ISO; no manual
+            # conversion needed.
             created_at = row.get('created_at')
             paid_at = row.get('paid_at')
             confirmed_at = row.get('confirmed_at')
             expires_at = row.get('expires_at')
-            if hasattr(created_at, 'isoformat'):
-                created_at = created_at.isoformat()
-            if hasattr(paid_at, 'isoformat'):
-                paid_at = paid_at.isoformat()
-            if hasattr(confirmed_at, 'isoformat'):
-                confirmed_at = confirmed_at.isoformat()
-            if hasattr(expires_at, 'isoformat'):
-                expires_at = expires_at.isoformat()
 
             items.append({
                 'id': row['id'],
@@ -1594,6 +1709,9 @@ def get_admin_orders():
                 'address': row.get('address') or '',
                 'tx_hash': row.get('tx_hash') or '',
                 'status': row.get('status') or '',
+                'matched_via': row.get('matched_via') or '',
+                'admin_note': row.get('admin_note') or '',
+                'manual_confirmed_by': row.get('manual_confirmed_by'),
                 'created_at': created_at,
                 'paid_at': paid_at,
                 'confirmed_at': confirmed_at,
@@ -1621,6 +1739,167 @@ def get_admin_orders():
         logger.error(f"get_admin_orders failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/admin-orders/<int:order_id>/manual-confirm', methods=['POST'])
+@login_required
+@admin_required
+def manual_confirm_order(order_id: int):
+    """
+    Admin-only "rescue" lever for USDT orders.
+
+    Use case: the buyer paid the correct amount to the correct receiving
+    address, but the on-chain reconciler missed the transaction (RPC
+    outage, exotic wallet, chain-specific edge case, off-chain mistake
+    where the customer used a slightly different amount than the order
+    suffix demanded, etc.). Without this endpoint the admin's only option
+    is to ``UPDATE qd_usdt_orders ...`` by hand and then somehow trigger
+    ``purchase_membership``; this surface does both atomically and leaves
+    an audit trail.
+
+    Body:
+        {
+            "tx_hash": "<on-chain tx hash>",     # required
+            "note":    "<free-form audit note>"  # optional
+        }
+
+    Behavior:
+        - Flips the order to 'confirmed'.
+        - Stamps tx_hash + paid_at (if empty) + confirmed_at + admin_note
+          + manual_confirmed_by + matched_via='manual_admin'.
+        - Calls ``purchase_membership`` exactly once per order (idempotent
+          on re-submit — already-confirmed orders only refresh the audit
+          fields, no double-grant).
+        - Refuses ``status='cancelled'`` orders so the admin doesn't
+          accidentally resurrect a deliberately-cancelled refund.
+    """
+    try:
+        admin_user_id = getattr(g, 'user_id', None)
+        body = request.get_json(silent=True) or {}
+        tx_hash = (body.get('tx_hash') or '').strip()
+        note = (body.get('note') or '').strip()
+
+        if not tx_hash:
+            return jsonify({'code': 0, 'msg': 'missing_tx_hash', 'data': None}), 400
+        if len(tx_hash) > 120:
+            return jsonify({'code': 0, 'msg': 'tx_hash_too_long', 'data': None}), 400
+        if len(note) > 1000:
+            return jsonify({'code': 0, 'msg': 'note_too_long', 'data': None}), 400
+
+        _ensure_usdt_admin_columns()
+
+        # Load order in a short read txn (don't hold a lock across the
+        # billing call below — purchase_membership opens its own conn).
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, plan, status, chain
+                FROM qd_usdt_orders WHERE id = ?
+                """,
+                (order_id,),
+            )
+            order = cur.fetchone()
+            cur.close()
+
+        if not order:
+            return jsonify({'code': 0, 'msg': 'order_not_found', 'data': None}), 404
+
+        current_status = (order.get('status') or '').lower()
+        user_id = order.get('user_id')
+        plan = order.get('plan')
+
+        if current_status == 'cancelled':
+            # Cancelled orders are deliberately retired — surfacing this
+            # as an error forces the admin to recreate the order instead
+            # of silently rescuing a refunded one.
+            return jsonify({
+                'code': 0,
+                'msg': 'order_cancelled',
+                'data': {'order_id': order_id, 'status': current_status},
+            }), 400
+
+        already_confirmed = current_status == 'confirmed'
+
+        # Stamp confirmation + audit fields. COALESCE on paid_at /
+        # confirmed_at means re-running this for amendments (e.g. fix a
+        # typo in the tx hash) preserves the original timestamps.
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE qd_usdt_orders
+                SET status = 'confirmed',
+                    tx_hash = ?,
+                    paid_at = COALESCE(paid_at, NOW()),
+                    confirmed_at = COALESCE(confirmed_at, NOW()),
+                    admin_note = ?,
+                    manual_confirmed_by = ?,
+                    matched_via = 'manual_admin',
+                    updated_at = NOW()
+                WHERE id = ?
+                """,
+                (tx_hash, note or None, admin_user_id, order_id),
+            )
+            db.commit()
+            cur.close()
+
+        # Grant membership only when transitioning into 'confirmed' for
+        # the first time — re-submits (already confirmed) should only
+        # update the audit fields above, never grant another membership.
+        billing_msg = ''
+        if not already_confirmed:
+            try:
+                from app.services.billing_service import get_billing_service
+                billing = get_billing_service()
+                ok, billing_msg, _ = billing.purchase_membership(
+                    int(user_id),
+                    str(plan),
+                    record_membership_order=False,
+                    fulfillment_ref=f"manual_usdt:{order_id}:by_{admin_user_id}",
+                )
+                logger.info(
+                    "[ManualConfirm] order=%s user=%s plan=%s admin=%s ok=%s msg=%s",
+                    order_id, user_id, plan, admin_user_id, ok, billing_msg,
+                )
+                if not ok:
+                    # Order row is already 'confirmed' at this point;
+                    # surface the billing error so the admin knows to
+                    # retry / dig in. We deliberately don't roll back the
+                    # status because the on-chain payment IS real.
+                    return jsonify({
+                        'code': 0,
+                        'msg': f'order_confirmed_but_billing_failed:{billing_msg}',
+                        'data': {'order_id': order_id, 'billing_error': billing_msg},
+                    }), 500
+            except Exception as exc:
+                logger.error(
+                    "[ManualConfirm] billing exception order=%s err=%s",
+                    order_id, exc, exc_info=True,
+                )
+                return jsonify({
+                    'code': 0,
+                    'msg': f'order_confirmed_but_billing_exception:{exc}',
+                    'data': {'order_id': order_id},
+                }), 500
+
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'order_id': order_id,
+                'user_id': user_id,
+                'plan': plan,
+                'status': 'confirmed',
+                'tx_hash': tx_hash,
+                'admin_note': note,
+                'manual_confirmed_by': admin_user_id,
+                'already_confirmed': already_confirmed,
+            },
+        })
+    except Exception as e:
+        logger.error(f"manual_confirm_order failed: {e}", exc_info=True)
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
@@ -1785,30 +2064,19 @@ def get_admin_ai_stats():
             cur.close()
 
         # Build per-user items
+        from app.utils.timeutil import to_utc_iso
+
         user_items = []
         for row in user_rows:
             uid = row.get('user_id')
             if not uid:  # Skip rows with NULL user_id
                 continue
-                
+
             ms = memory_stats_map.get(uid, {})
-            last_at = row.get('last_analysis_at')
-            first_at = row.get('first_analysis_at')
-            
-            # Convert datetime to ISO format string if needed
-            if last_at and hasattr(last_at, 'isoformat'):
-                last_at = last_at.isoformat()
-            elif last_at:
-                last_at = str(last_at)
-            else:
-                last_at = None
-                
-            if first_at and hasattr(first_at, 'isoformat'):
-                first_at = first_at.isoformat()
-            elif first_at:
-                first_at = str(first_at)
-            else:
-                first_at = None
+            # Server stores naive TIMESTAMP in container TZ; emit UTC ISO so the
+            # browser can render it in the user's locale correctly.
+            last_at = to_utc_iso(row.get('last_analysis_at'))
+            first_at = to_utc_iso(row.get('first_analysis_at'))
 
             user_items.append({
                 'user_id': int(uid),
@@ -1832,24 +2100,9 @@ def get_admin_ai_stats():
             user_id = row.get('user_id')
             if not user_id:  # Skip rows with NULL user_id
                 continue
-                
-            created_at = row.get('created_at')
-            completed_at = row.get('completed_at')
-            
-            # Convert datetime to ISO format string if needed
-            if created_at and hasattr(created_at, 'isoformat'):
-                created_at = created_at.isoformat()
-            elif created_at:
-                created_at = str(created_at)
-            else:
-                created_at = None
-                
-            if completed_at and hasattr(completed_at, 'isoformat'):
-                completed_at = completed_at.isoformat()
-            elif completed_at:
-                completed_at = str(completed_at)
-            else:
-                completed_at = None
+
+            created_at = to_utc_iso(row.get('created_at'))
+            completed_at = to_utc_iso(row.get('completed_at'))
 
             recent_items.append({
                 'id': int(row.get('id') or 0),
@@ -1894,178 +2147,24 @@ def get_admin_ai_stats():
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
-# ============================================================================
-# API Key Management Routes (用户API Key管理)
-# ============================================================================
+# ==================== Admin User Dashboard Stats ====================
 
-@user_bp.route('/api-key/create', methods=['POST'])
+@user_bp.route('/admin/stats', methods=['GET'])
 @login_required
-def create_api_key():
-    """
-    为当前用户创建新的API Key
-    
-    Request body:
-        key_name: str (optional, default 'Default')
-        description: str (optional, default '')
-        expires_days: int (optional, default 365, 0表示永不过期)
-        credential_id: int (optional, 绑定的交易所配置ID)
+@admin_required
+def get_admin_user_stats():
+    """KPI dashboard data for the User Management tab (admin only).
+
+    Returns a single envelope with `summary`, `growth`, `activity`.
+    See `app.services.user_stats_service` for the schema of each section.
     """
     try:
-        from app.services.api_key_manager import APIKeyService
-        
-        user_id = g.user_id
-        data = request.get_json() or {}
-        
-        key_name = data.get('key_name', 'Default')
-        description = data.get('description', '')
-        expires_days = data.get('expires_days', 365)
-        credential_id = data.get('credential_id')  # 新增：绑定的交易所配置ID
-        
-        # Validate input
-        if not key_name or len(key_name) > 100:
-            return jsonify({
-                'code': 0,
-                'msg': '密钥名称不能为空且不能超过100个字符',
-                'data': None
-            }), 400
-        
-        if len(description) > 500:
-            return jsonify({
-                'code': 0,
-                'msg': '描述不能超过500个字符',
-                'data': None
-            }), 400
-        
-        result = APIKeyService.create_api_key(
-            user_id=user_id,
-            key_name=key_name,
-            description=description,
-            expires_days=expires_days,
-            credential_id=credential_id  # 传入 credential_id
-        )
-        
-        logger.info(f"User {user_id} created new API key: {key_name} (credential: {credential_id})")
-        
-        return jsonify({
-            'code': 1,
-            'msg': 'API Key创建成功，请妥善保存（只显示一次）',
-            'data': result
-        })
+        from app.services.user_stats_service import get_user_admin_stats
+
+        data = get_user_admin_stats()
+        return jsonify({'code': 1, 'msg': 'success', 'data': data})
     except Exception as e:
-        logger.error(f"create_api_key failed: {e}")
+        logger.error(f"get_admin_user_stats failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
-
-
-@user_bp.route('/api-key/list', methods=['GET'])
-@login_required
-def list_api_keys():
-    """
-    获取当前用户的所有API Key列表
-    """
-    try:
-        from app.services.api_key_manager import APIKeyService
-        
-        user_id = g.user_id
-        keys = APIKeyService.get_user_api_keys(user_id)
-        
-        return jsonify({
-            'code': 1,
-            'msg': 'success',
-            'data': {
-                'keys': keys,
-                'total': len(keys)
-            }
-        })
-    except Exception as e:
-        logger.error(f"list_api_keys failed: {e}")
-        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
-
-
-@user_bp.route('/api-key/revoke', methods=['POST'])
-@login_required
-def revoke_api_key():
-    """
-    停用指定的API Key
-    
-    Request body:
-        key_id: int (required)
-    """
-    try:
-        from app.services.api_key_manager import APIKeyService
-        
-        user_id = g.user_id
-        data = request.get_json() or {}
-        key_id = data.get('key_id')
-        
-        if not key_id:
-            return jsonify({
-                'code': 0,
-                'msg': '缺少key_id参数',
-                'data': None
-            }), 400
-        
-        success = APIKeyService.revoke_api_key(user_id, key_id)
-        
-        if not success:
-            return jsonify({
-                'code': 0,
-                'msg': 'API Key不存在或不属于当前用户',
-                'data': None
-            }), 404
-        
-        logger.info(f"User {user_id} revoked API key: {key_id}")
-        
-        return jsonify({
-            'code': 1,
-            'msg': 'API Key已停用',
-            'data': None
-        })
-    except Exception as e:
-        logger.error(f"revoke_api_key failed: {e}")
-        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
-
-
-@user_bp.route('/api-key/delete', methods=['DELETE'])
-@login_required
-def delete_api_key():
-    """
-    删除指定的API Key
-    
-    Request body:
-        key_id: int (required)
-    """
-    try:
-        from app.services.api_key_manager import APIKeyService
-        
-        user_id = g.user_id
-        data = request.get_json() or {}
-        key_id = data.get('key_id')
-        
-        if not key_id:
-            return jsonify({
-                'code': 0,
-                'msg': '缺少key_id参数',
-                'data': None
-            }), 400
-        
-        success = APIKeyService.delete_api_key(user_id, key_id)
-        
-        if not success:
-            return jsonify({
-                'code': 0,
-                'msg': 'API Key不存在或不属于当前用户',
-                'data': None
-            }), 404
-        
-        logger.info(f"User {user_id} deleted API key: {key_id}")
-        
-        return jsonify({
-            'code': 1,
-            'msg': 'API Key已删除',
-            'data': None
-        })
-    except Exception as e:
-        logger.error(f"delete_api_key failed: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500

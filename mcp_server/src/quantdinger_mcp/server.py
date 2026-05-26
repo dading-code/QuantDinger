@@ -9,8 +9,6 @@ This is intentionally a thin wrapper:
 If you want to expose more (e.g. trading), prefer issuing a token with the
 right scopes and keep this server unchanged — that way the security boundary
 stays in the Gateway, not in the MCP layer.
-
-Includes MT5 MCP tools ported from AI_Trading_Monitor_MT5_Observer project.
 """
 from __future__ import annotations
 
@@ -20,25 +18,6 @@ from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
-
-# Import MT5 tools
-try:
-    from .mt5_tools import (
-        mt5_get_account_info,
-        mt5_get_open_positions,
-        mt5_get_ohlc_data,
-        mt5_get_market_data,
-        mt5_get_trade_history,
-        mt5_get_tick_data,
-        mt5_get_market_depth,
-        mt5_get_kronos_history,
-        mt5_get_symbols,
-        mt5_get_pending_orders,
-        mt5_get_connection_status,
-    )
-    _mt5_available = True
-except ImportError:
-    _mt5_available = False
 
 
 def _env(name: str, required: bool = True) -> str:
@@ -260,154 +239,6 @@ def submit_structured_tune(payload: dict) -> Any:
     (grid) or `randomTrials` (random). See `docs/AI_TRADING_SYSTEM_PLAN_CN.md`.
     """
     return _post("/api/agent/v1/experiments/structured-tune", json=payload)
-
-
-# ───────────────────────────── MT5-class tools ─────────────────────────────
-# Ported from AI_Trading_Monitor_MT5_Observer project
-
-def _mt5_tool_wrapper(func):
-    """Wrapper for MT5 tools to handle availability check."""
-    def wrapper(*args, **kwargs):
-        if not _mt5_available:
-            return {
-                "success": False,
-                "error": "MT5 tools not available. MetaTrader5 library not installed."
-            }
-        import asyncio
-        return asyncio.run(func(*args, **kwargs))
-    return wrapper
-
-
-if _mt5_available:
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_account_info() -> Any:
-        """Get MT5 account information including balance, equity, margin."""
-        return await mt5_get_account_info({})
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_open_positions(symbol: str = "") -> Any:
-        """Get current open positions from MT5.
-        
-        Args:
-            symbol: Optional symbol filter (e.g., "XAUUSD.c")
-        """
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        return await mt5_get_open_positions(params)
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_ohlc_data(symbol: str = "XAUUSD.c", timeframe: str = "H1", count: int = 100) -> Any:
-        """Get OHLC candlestick data from MT5.
-        
-        Args:
-            symbol: Trading symbol (default: XAUUSD.c)
-            timeframe: Timeframe (M1, M5, M15, M30, H1, H4, D1, W1, MN)
-            count: Number of candles to fetch (max 1000)
-        """
-        return await mt5_get_ohlc_data({
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "count": count
-        })
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_market_data(symbol: str = "XAUUSD.c", timeframe: str = "H1", count: int = 50) -> Any:
-        """Get market data including tick and candles from MT5.
-        
-        Args:
-            symbol: Trading symbol (default: XAUUSD.c)
-            timeframe: Timeframe for candles
-            count: Number of candles
-        """
-        return await mt5_get_market_data({
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "count": count
-        })
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_trade_history(days: int = 7) -> Any:
-        """Get trade history from MT5 for the specified number of days.
-        
-        Args:
-            days: Number of days to look back (default: 7)
-        """
-        return await mt5_get_trade_history({"days": days})
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_tick_data(symbol: str = "XAUUSD.c", lookback_minutes: int = 5) -> Any:
-        """Get tick data from MT5 for order flow analysis.
-        
-        Args:
-            symbol: Trading symbol (default: XAUUSD.c)
-            lookback_minutes: Lookback period in minutes (default: 5)
-        """
-        return await mt5_get_tick_data({
-            "symbol": symbol,
-            "lookback_minutes": lookback_minutes
-        })
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_market_depth(symbol: str = "XAUUSD.c") -> Any:
-        """Get market depth (DOM) data from MT5.
-        
-        Args:
-            symbol: Trading symbol (default: XAUUSD.c)
-        """
-        return await mt5_get_market_depth({"symbol": symbol})
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_kronos_history(symbol: str = "XAUUSD.c", days: int = 7, timeframe: str = "M15") -> Any:
-        """Get Kronos history data for AI analysis.
-        
-        Args:
-            symbol: Trading symbol (default: XAUUSD.c)
-            days: Number of days (default: 7)
-            timeframe: Timeframe (default: M15)
-        """
-        return await mt5_get_kronos_history({
-            "symbol": symbol,
-            "days": days,
-            "timeframe": timeframe
-        })
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_symbols(group: str = "*") -> Any:
-        """Get available symbols from MT5.
-        
-        Args:
-            group: Symbol group filter (e.g., "*USD*", "Forex*")
-        """
-        return await mt5_get_symbols({"group": group})
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_pending_orders(symbol: str = "") -> Any:
-        """Get pending orders from MT5.
-        
-        Args:
-            symbol: Optional symbol filter
-        """
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        return await mt5_get_pending_orders(params)
-
-    @mcp.tool()
-    @_mt5_tool_wrapper
-    async def mt5_get_connection_status() -> Any:
-        """Get MT5 connection status."""
-        return await mt5_get_connection_status({})
 
 
 _TRANSPORTS = {"stdio", "sse", "streamable-http"}

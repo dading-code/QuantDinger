@@ -43,11 +43,6 @@ def register(app) -> None:
     from . import quick_trade  # noqa: F401
     from . import jobs as jobs_module  # noqa: F401
     from . import admin  # noqa: F401
-    from . import websocket as websocket_module  # noqa: F401
 
     app.register_blueprint(agent_v1_bp, url_prefix="/api/agent/v1")
-    
-    # Register WebSocket routes
-    websocket_module.register(app)
-    
     logger.info("Agent Gateway v1 mounted at /api/agent/v1")

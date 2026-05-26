@@ -55,22 +55,18 @@ def _api_key_hint(api_key: str) -> str:
 @credentials_bp.route('/list', methods=['GET'])
 @login_required
 def list_credentials():
-    """List all credentials for the current user with associated API Keys."""
+    """List all credentials for the current user."""
     try:
         user_id = g.user_id
 
         with get_db_connection() as db:
             cur = db.cursor()
-            # 关联查询API Key信息
             cur.execute(
                 """
-                SELECT ec.id, ec.user_id, ec.name, ec.exchange_id, ec.api_key_hint, 
-                       ec.encrypted_config, ec.created_at, ec.updated_at,
-                       ak.api_key as api_key_value, ak.key_name as api_key_name
-                FROM qd_exchange_credentials ec
-                LEFT JOIN qd_api_keys ak ON ec.id = ak.credential_id AND ak.active = true
-                WHERE ec.user_id = %s
-                ORDER BY ec.id DESC
+                SELECT id, user_id, name, exchange_id, api_key_hint, encrypted_config, created_at, updated_at
+                FROM qd_exchange_credentials
+                WHERE user_id = %s
+                ORDER BY id DESC
                 """,
                 (user_id,)
             )
@@ -88,19 +84,6 @@ def list_credentials():
             except Exception:
                 item['enable_demo_trading'] = False
             item.pop('encrypted_config', None)
-            
-            # 脱敏处理API Key（只显示前8位和后4位）
-            api_key_value = item.pop('api_key_value', None)
-            if api_key_value:
-                if len(api_key_value) > 12:
-                    item['api_key'] = api_key_value[:8] + '...' + api_key_value[-4:]
-                else:
-                    item['api_key'] = api_key_value
-                # 安全最佳实践：不向客户端返回完整 API 密钥
-                # 如果需要复制功能，应使用单独的带二次验证的端点
-            else:
-                item['api_key'] = None
-            
             items.append(item)
 
         return jsonify({'code': 1, 'msg': 'success', 'data': {'items': items}})
@@ -177,7 +160,29 @@ def create_credential():
         config = {'exchange_id': exchange_id}
         hint = ''
 
-        if exchange_id == 'ibkr':
+        if exchange_id == 'alpaca':
+            # Alpaca: REST-only broker (no local terminal). Paper/live is decided
+            # by the API key prefix at runtime — PK* hits paper-api.alpaca.markets,
+            # AK* hits api.alpaca.markets. We deliberately do NOT expose a paper
+            # toggle in the UI: the user provides whichever key matches the env
+            # they want to trade in, and factory.create_alpaca_client routes
+            # automatically. base_url is still accepted as an explicit override
+            # (rare — only useful behind a corporate proxy or for unit tests).
+            api_key = (data.get('api_key') or data.get('apiKey') or '').strip()
+            secret_key = (data.get('secret_key') or data.get('secretKey') or '').strip()
+            if not api_key or not secret_key:
+                return jsonify({'code': 0, 'msg': 'Missing api_key/secret_key', 'data': None}), 400
+
+            config.update({
+                'api_key': api_key,
+                'secret_key': secret_key,
+                'base_url': (data.get('base_url') or data.get('baseUrl') or '').strip(),
+            })
+            # Surface the inferred env in the hint so the credential list still
+            # tells users at a glance whether this key targets paper or live.
+            env_tag = 'paper' if api_key.upper().startswith('PK') else 'live'
+            hint = f"{_api_key_hint(api_key)} ({env_tag})"
+        elif exchange_id == 'ibkr':
             # Interactive Brokers (US stocks)
             # clientId must differ from manual /api/ibkr/connect (defaults to 1) or TWS drops one session.
             _ib_cid = data.get('ibkr_client_id')
@@ -199,28 +204,6 @@ def create_credential():
             mt5_password = (data.get('mt5_password') or '').strip()
             if not mt5_server or not mt5_login or not mt5_password:
                 return jsonify({'code': 0, 'msg': 'Missing mt5_server/mt5_login/mt5_password', 'data': None}), 400
-            
-            # 尝试验证 MT5 账号并获取实际 Login ID
-            expected_account_id = ''
-            try:
-                from app.services.live_trading.factory import create_mt5_client
-                client = create_mt5_client({
-                    'exchange_id': 'mt5',
-                    'mt5_login': mt5_login,
-                    'mt5_password': mt5_password,
-                    'mt5_server': mt5_server,
-                    'market_category': 'Forex'
-                })
-                account_info = client.get_account_info()
-                if account_info and 'login' in account_info:
-                    expected_account_id = str(account_info['login'])
-                    logger.info(f"MT5 credential verified. Expected Account ID: {expected_account_id}")
-                client.disconnect()
-            except Exception as e:
-                logger.warning(f"Failed to verify MT5 credentials during binding: {e}")
-                # 即使验证失败也允许保存，但会记录警告
-                expected_account_id = mt5_login
-
             config.update({
                 'mt5_server': mt5_server,
                 'mt5_login': mt5_login,
@@ -265,6 +248,53 @@ def create_credential():
         return jsonify({'code': 1, 'msg': 'success', 'data': {'id': new_id}})
     except Exception as e:
         logger.error(f"create_credential failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@credentials_bp.route('/update-name', methods=['PUT', 'PATCH'])
+@login_required
+def update_credential_name():
+    """Update display name (alias) only — API keys in encrypted_config are untouched."""
+    try:
+        user_id = g.user_id
+        data = request.get_json() or {}
+        cred_id = data.get('id')
+        if cred_id is None:
+            cred_id = request.args.get('id', type=int)
+        try:
+            cred_id = int(cred_id)
+        except (TypeError, ValueError):
+            cred_id = None
+        if not cred_id:
+            return jsonify({'code': 0, 'msg': 'Missing id', 'data': None}), 400
+
+        name = (data.get('name') or '').strip()
+        if len(name) > 128:
+            return jsonify({'code': 0, 'msg': 'Name too long (max 128 characters)', 'data': None}), 400
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE qd_exchange_credentials
+                SET name = %s, updated_at = NOW()
+                WHERE id = %s AND user_id = %s
+                RETURNING id, name, exchange_id, api_key_hint, created_at, updated_at
+                """,
+                (name, cred_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                return jsonify({'code': 0, 'msg': 'Not found', 'data': None}), 404
+            db.commit()
+            cur.close()
+
+        item = dict(row or {})
+        return jsonify({'code': 1, 'msg': 'success', 'data': item})
+    except Exception as e:
+        logger.error(f"update_credential_name failed: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
@@ -343,116 +373,6 @@ def get_credential():
     except Exception as e:
         logger.error(f"get_credential failed: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
-
-
-# ============================================================================
-# Local Broker Helper APIs (for MT5, IBKR that require local client)
-# ============================================================================
-
-LOCAL_BROKERS = ['mt5', 'ibkr']
-
-
-@credentials_bp.route('/is-local-broker', methods=['GET'])
-@login_required
-def is_local_broker():
-    """
-    Check if an exchange requires local execution (MT5, IBKR).
-    
-    Query params:
-        exchange_id: Exchange identifier (e.g., 'mt5', 'ibkr', 'binance')
-    
-    Returns:
-        {
-            "code": 1,
-            "data": {
-                "is_local": true,
-                "exchange_id": "mt5",
-                "requires_client": true,
-                "client_download_url": "/download/local-client"
-            }
-        }
-    """
-    try:
-        exchange_id = request.args.get('exchange_id', '').lower().strip()
-        
-        if not exchange_id:
-            return jsonify({'code': 0, 'msg': 'Missing exchange_id parameter', 'data': None}), 400
-        
-        is_local = exchange_id in LOCAL_BROKERS
-        
-        return jsonify({
-            'code': 1,
-            'msg': 'success',
-            'data': {
-                'exchange_id': exchange_id,
-                'is_local': is_local,
-                'requires_client': is_local,
-                'client_download_url': '/download/local-client' if is_local else None,
-                'client_name': 'QuantDinger Local Client' if is_local else None,
-                'description': '需要下载本地客户端以接收交易信号并执行' if is_local else None
-            }
-        })
-    except Exception as e:
-        logger.error(f"is_local_broker failed: {e}")
-        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
-
-
-@credentials_bp.route('/local-brokers/list', methods=['GET'])
-@login_required
-def list_local_brokers():
-    """
-    Get list of all exchanges that require local execution.
-    
-    Returns:
-        {
-            "code": 1,
-            "data": {
-                "brokers": [
-                    {
-                        "exchange_id": "mt5",
-                        "name": "MetaTrader 5",
-                        "requires_client": true,
-                        "description": "外汇/差价合约交易平台"
-                    },
-                    {
-                        "exchange_id": "ibkr",
-                        "name": "Interactive Brokers",
-                        "requires_client": true,
-                        "description": "美股/全球股票交易平台"
-                    }
-                ]
-            }
-        }
-    """
-    try:
-        brokers = [
-            {
-                'exchange_id': 'mt5',
-                'name': 'MetaTrader 5',
-                'requires_client': True,
-                'description': '外汇/差价合约交易平台',
-                'icon': 'mt5'
-            },
-            {
-                'exchange_id': 'ibkr',
-                'name': 'Interactive Brokers',
-                'requires_client': True,
-                'description': '美股/全球股票交易平台',
-                'icon': 'ibkr'
-            }
-        ]
-        
-        return jsonify({
-            'code': 1,
-            'msg': 'success',
-            'data': {
-                'brokers': brokers,
-                'total': len(brokers)
-            }
-        })
-    except Exception as e:
-        logger.error(f"list_local_brokers failed: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 

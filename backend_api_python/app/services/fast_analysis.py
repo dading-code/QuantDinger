@@ -208,7 +208,6 @@ class FastAnalysisService:
         *,
         include_macro: bool = True,
         include_news: bool = True,
-        include_polymarket: bool = True,
         timeout: int = 45,
     ) -> Dict[str, Any]:
         """
@@ -219,7 +218,6 @@ class FastAnalysisService:
         2. 基本面: 公司信息、财务数据
         3. 宏观数据: DXY、VIX、TNX、黄金等
         4. 情绪数据: 新闻、市场情绪
-        5. 预测市场: 相关预测市场事件（新增）
         """
         return self.data_collector.collect_all(
             market=market,
@@ -227,7 +225,6 @@ class FastAnalysisService:
             timeframe=timeframe,
             include_macro=include_macro,
             include_news=include_news,
-            include_polymarket=include_polymarket,  # 包含预测市场数据
             timeout=timeout,  # 增加超时时间，确保数据收集完成
         )
     
@@ -371,19 +368,6 @@ class FastAnalysisService:
         
         return "\n".join(summaries) if summaries else "No recent news available."
     
-    def _format_polymarket_summary(self, polymarket_events: List[Dict], max_items: int = 3) -> str:
-        """Format prediction market events into a concise summary for the prompt."""
-        if not polymarket_events:
-            return "No related prediction market events found."
-        
-        summaries = []
-        for event in polymarket_events[:max_items]:
-            question = event.get('question', '')
-            prob = event.get('current_probability', 50.0)
-            summaries.append(f"- {question[:80]}: Market probability {prob:.1f}%")
-        
-        return "\n".join(summaries) if summaries else "No related prediction market events found."
-
     def _format_crypto_factor_prompt(self, crypto_factors: Dict[str, Any], language: str) -> str:
         """Format crypto-specific market structure data for prompts."""
         if not crypto_factors:
@@ -499,7 +483,6 @@ class FastAnalysisService:
         crypto_factors = data.get("crypto_factors") or {}
         is_crypto = str(data.get("market") or "").strip().lower() == "crypto"
         news_summary = self._format_news_summary(data.get("news") or [])
-        polymarket_events = data.get("polymarket") or []
         
         # Language instruction - MUST be enforced strictly
         lang_map = {
@@ -724,9 +707,6 @@ When the score is neutral (-20 to +20), you can use your judgment, but still con
 📰 MARKET NEWS ({len(data.get('news') or [])} items):
 {news_summary}
 
-🎯 PREDICTION MARKETS ({len(polymarket_events)} related events):
-{self._format_polymarket_summary(polymarket_events)}
-
 💼 FUNDAMENTALS / MARKET STRUCTURE:
 - Company: {company.get('name', data['symbol'])}
 - Industry: {company.get('industry', 'N/A')}
@@ -756,21 +736,7 @@ IMPORTANT:
 3. Pay attention to BREAKING NEWS and international events that could cause sudden market moves. Geopolitical tensions (e.g., US-Iran conflict) can cause severe market volatility.
 4. For Crypto, explicitly explain whether derivatives + capital flow data confirm or contradict price action. For US stocks, analyze financial statements and earnings trends to assess company health.
 5. If you see news about wars, conflicts, or major geopolitical events, you MUST mention them in your analysis and adjust your recommendation accordingly.
-6. Provide your analysis now. Remember: all prices must be within 10% of ${current_price}.
-
-OUTPUT FORMAT REQUIREMENT (MANDATORY):
-You MUST return ONLY a valid JSON object with the following structure:
-{{
-    "decision": "BUY" or "SELL" or "HOLD",
-    "confidence": number between 0-100,
-    "summary": "Your detailed analysis summary in Chinese",
-    "key_reasons": ["Reason 1", "Reason 2", "Reason 3"],
-    "risks": ["Risk 1", "Risk 2"],
-    "entry_price": number (close to current price),
-    "stop_loss": number,
-    "take_profit": number
-}}
-DO NOT include any other text, thinking, or markdown. ONLY return the JSON object."""
+6. Provide your analysis now. Remember: all prices must be within 10% of ${current_price}."""
 
         return system_prompt, user_prompt
     
@@ -1005,14 +971,13 @@ DO NOT include any other text, thinking, or markdown. ONLY return the JSON objec
                 # De-dup keep order
                 seen = set()
                 consensus_timeframes = [x for x in consensus_timeframes if not (x in seen or seen.add(x))]
-            # Collect primary data including macro/news/polymarket for prompt quality
+            # Collect primary data (macro + news) for prompt quality
             primary_data = self._collect_market_data(
                 market,
                 symbol,
                 primary_tf,
                 include_macro=True,
                 include_news=True,
-                include_polymarket=True,
             )
 
             # Collect extra timeframes for objective consensus (technical-only for cost)
@@ -1058,7 +1023,6 @@ DO NOT include any other text, thinking, or markdown. ONLY return the JSON objec
                         tf_norm,
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=25,
                     )
 
@@ -1091,7 +1055,6 @@ DO NOT include any other text, thinking, or markdown. ONLY return the JSON objec
                         "1W",
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=25,
                     )
                     cp_1w = _extract_current_price(d_1w) or 0.0
@@ -1115,7 +1078,6 @@ DO NOT include any other text, thinking, or markdown. ONLY return the JSON objec
                         "1H",
                         include_macro=False,
                         include_news=False,
-                        include_polymarket=False,
                         timeout=18,
                     )
                     cp_1h = _extract_current_price(d_1h) or 0.0
@@ -1147,8 +1109,6 @@ DO NOT include any other text, thinking, or markdown. ONLY return the JSON objec
                 quality_multiplier *= 0.85
             if "news" in failed_items:
                 quality_multiplier *= 0.8
-            if "polymarket" in failed_items:
-                quality_multiplier *= 0.9
             # If indicators missing key sections, reduce confidence more
             ind = primary_data.get("indicators") or {}
             if not ind or not ind.get("rsi") or not ind.get("moving_averages"):

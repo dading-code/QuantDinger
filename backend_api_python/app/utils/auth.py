@@ -96,7 +96,7 @@ def _verify_token_version(user_id: int, token_version: int) -> bool:
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "SELECT token_version FROM qd_users WHERE id = %s",
+                "SELECT token_version FROM qd_users WHERE id = ?",
                 (user_id,)
             )
             row = cur.fetchone()
