@@ -16,10 +16,10 @@
 # ========================
 # Environment & Secrets
 # ========================
-.env
+
 .env.local
 .env.*.local
-backend_api_python/.env
+
 
 # ========================
 # IDE & OS

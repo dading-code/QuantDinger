@@ -35,7 +35,6 @@ wheels/
 logs/
 
 # Environment variables
-.env
 .env.local
 
 # Local runtime data (do not commit)
