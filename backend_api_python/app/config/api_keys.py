@@ -131,6 +131,36 @@ class MetaAPIKeys(type):
         return val if val else ''
 
     @property
+    def ANYTHINGLLM_API_KEY(cls):
+        """AnythingLLM API key"""
+        env_val = os.getenv('ANYTHINGLLM_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('anythingllm', {}).get('api_key')
+        return val if val else ''
+
+    @property
+    def ANYTHINGLLM_API_URL(cls):
+        """AnythingLLM API base URL"""
+        env_val = os.getenv('ANYTHINGLLM_API_URL', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('anythingllm', {}).get('base_url')
+        return val if val else ''
+
+    @property
+    def ANYTHINGLLM_WORKSPACE(cls):
+        """AnythingLLM workspace name"""
+        env_val = os.getenv('ANYTHINGLLM_WORKSPACE', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('anythingllm', {}).get('workspace')
+        return val if val else ''
+
+    @property
     def MINIMAX_API_KEY(cls):
         """MiniMax API key"""
         env_val = os.getenv('MINIMAX_API_KEY', '').strip()

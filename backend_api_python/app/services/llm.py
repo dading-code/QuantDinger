@@ -25,6 +25,7 @@ class LLMProvider(Enum):
     GROK = "grok"
     CUSTOM = "custom"
     MINIMAX = "minimax"
+    ANYTHINGLLM = "anythingllm"
 
 
 # Provider configurations
@@ -64,6 +65,11 @@ PROVIDER_CONFIGS = {
         "default_model": "MiniMax-M2.7",
         "fallback_model": "MiniMax-M2.7-highspeed",
     },
+    LLMProvider.ANYTHINGLLM: {
+        "base_url": "",  # User configured via ANYTHINGLLM_API_URL
+        "default_model": "gpt-4o",
+        "fallback_model": "gpt-4o-mini",
+    },
 }
 
 
@@ -102,11 +108,12 @@ class LLMService:
                 pass
         
         # Auto-detect: find any provider with a configured API key
-        # Priority: DeepSeek > Grok > MiniMax > OpenAI > Google > OpenRouter
+        # Priority: DeepSeek > Grok > MiniMax > AnythingLLM > OpenAI > Google > OpenRouter
         priority_order = [
             LLMProvider.DEEPSEEK,
             LLMProvider.GROK,
             LLMProvider.MINIMAX,
+            LLMProvider.ANYTHINGLLM,
             LLMProvider.OPENAI,
             LLMProvider.GOOGLE,
             LLMProvider.OPENROUTER,
@@ -132,6 +139,7 @@ class LLMService:
             LLMProvider.GROK: APIKeys.GROK_API_KEY,
             LLMProvider.CUSTOM: APIKeys.CUSTOM_API_KEY,
             LLMProvider.MINIMAX: APIKeys.MINIMAX_API_KEY,
+            LLMProvider.ANYTHINGLLM: APIKeys.ANYTHINGLLM_API_KEY,
         }
         return key_map.get(p, "") or ""
 
@@ -146,6 +154,15 @@ class LLMService:
         # PR #56 uses CUSTOM_API_URL (not CUSTOM_BASE_URL); APIKeys mirrors env + addon.
         if p == LLMProvider.CUSTOM and not custom_url:
             custom_url = (os.getenv("CUSTOM_API_URL", "").strip() or (APIKeys.CUSTOM_API_URL or "")).strip()
+        
+        if p == LLMProvider.ANYTHINGLLM and not custom_url:
+            custom_url = (os.getenv("ANYTHINGLLM_API_URL", "").strip() or (APIKeys.ANYTHINGLLM_API_URL or "")).strip()
+        
+        if p == LLMProvider.ANYTHINGLLM and custom_url:
+            workspace = APIKeys.ANYTHINGLLM_WORKSPACE or os.getenv("ANYTHINGLLM_WORKSPACE", "").strip()
+            if workspace:
+                return f"{custom_url.rstrip('/')}/api/v1/workspace/{workspace}/chat"
+            return custom_url.rstrip('/')
 
         if custom_url:
             return custom_url.rstrip('/')
@@ -528,12 +545,13 @@ class LLMService:
         """
         Try alternative providers when current provider fails.
 
-        Priority: DeepSeek > Grok > MiniMax > OpenAI > Google > OpenRouter
+        Priority: DeepSeek > Grok > MiniMax > AnythingLLM > OpenAI > Google > OpenRouter
         """
         priority_order = [
             LLMProvider.DEEPSEEK,
             LLMProvider.GROK,
             LLMProvider.MINIMAX,
+            LLMProvider.ANYTHINGLLM,
             LLMProvider.OPENAI,
             LLMProvider.GOOGLE,
             LLMProvider.OPENROUTER,

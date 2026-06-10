@@ -364,6 +364,7 @@ CONFIG_SCHEMA = {
                     {'value': 'grok', 'label': 'xAI Grok'},
                     {'value': 'custom', 'label': 'Custom API (OpenAI-compatible)'},
                     {'value': 'minimax', 'label': 'MiniMax'},
+                    {'value': 'anythingllm', 'label': 'AnythingLLM (Local Knowledge)'},
                 ],
                 'description': 'Select your preferred LLM provider'
             },
@@ -547,6 +548,31 @@ CONFIG_SCHEMA = {
                 'default': 'https://api.minimax.io/v1',
                 'description': 'MiniMax API endpoint',
                 'group': 'minimax'
+            },
+            # AnythingLLM
+            {
+                'key': 'ANYTHINGLLM_API_KEY',
+                'label': 'AnythingLLM API Key',
+                'type': 'password',
+                'required': False,
+                'description': 'API key for AnythingLLM. Required for authentication.',
+                'group': 'anythingllm'
+            },
+            {
+                'key': 'ANYTHINGLLM_API_URL',
+                'label': 'AnythingLLM API URL',
+                'type': 'text',
+                'default': '',
+                'description': 'Base URL of your AnythingLLM server (e.g. http://localhost:3001)',
+                'group': 'anythingllm'
+            },
+            {
+                'key': 'ANYTHINGLLM_WORKSPACE',
+                'label': 'AnythingLLM Workspace',
+                'type': 'text',
+                'default': '',
+                'description': 'Workspace name in AnythingLLM to use for analysis',
+                'group': 'anythingllm'
             },
             # Common settings
             {

@@ -25,10 +25,21 @@ except ImportError:
     logger.warning("bcrypt not installed. Using SHA256 for password hashing (less secure).")
 
 
+# 默认品种 (外汇 + 贵金属 + 加密货币 + 美股)
+# 注: 加密货币使用 CCXT/Coinbase 免费 API
 _DEFAULT_WATCHLIST = [
+    # 加密货币 (Crypto) - 使用 CCXT/Coinbase
     ("Crypto", "BTC/USDT", "Bitcoin"),
     ("Crypto", "ETH/USDT", "Ethereum"),
     ("Crypto", "SOL/USDT", "Solana"),
+    # 外汇 (Forex)
+    ("Forex", "EURUSD.c", "EUR/USD"),
+    ("Forex", "GBPUSD.c", "GBP/USD"),
+    ("Forex", "USDJPY.c", "USD/JPY"),
+    ("Forex", "AUDUSD", "AUD/USD"),
+    # 贵金属 (Metals)
+    ("Forex", "XAUUSD.c", "XAU/USD (Gold)"),
+    # 美股 (US Stock)
     ("USStock", "AAPL", "Apple"),
     ("USStock", "NVDA", "NVIDIA"),
     ("USStock", "TSLA", "Tesla"),
