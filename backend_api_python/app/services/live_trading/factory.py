@@ -131,6 +131,28 @@ def _demo_enabled(cfg: Dict[str, Any]) -> bool:
     return exchange_demo_mode_enabled(cfg)
 
 
+def _get_proxies_from_env() -> Optional[Dict[str, str]]:
+    """
+    Get proxy configuration from environment variables.
+    Supports: PROXY_URL, HTTP_PROXY, HTTPS_PROXY, ALL_PROXY
+    """
+    proxy_url = (os.getenv('PROXY_URL') or '').strip()
+    if not proxy_url:
+        for key in ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY']:
+            v = (os.getenv(key) or '').strip()
+            if v:
+                proxy_url = v
+                break
+    
+    if not proxy_url:
+        return None
+    
+    return {
+        'http': proxy_url,
+        'https': proxy_url,
+    }
+
+
 def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap") -> BaseRestClient:
     if not isinstance(exchange_config, dict):
         raise LiveTradingError("Invalid exchange_config")
@@ -144,6 +166,7 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         mt = "swap"
 
     is_demo = _demo_enabled(exchange_config)
+    proxies = _get_proxies_from_env()
 
     if exchange_id == "binance":
         spot_broker_id = _get(exchange_config, "spot_broker_id", "spotBrokerId", "broker_id", "brokerId") or "A2NAPZAC"
@@ -152,12 +175,12 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
             # Binance Spot Testnet: https://testnet.binance.vision (official)
             default_url = "https://testnet.binance.vision" if is_demo else "https://api.binance.com"
             base_url = _get(exchange_config, "base_url", "baseUrl") or default_url
-            return BinanceSpotClient(api_key=api_key, secret_key=secret_key, base_url=base_url, enable_demo_trading=is_demo, broker_id=spot_broker_id)
+            return BinanceSpotClient(api_key=api_key, secret_key=secret_key, base_url=base_url, enable_demo_trading=is_demo, broker_id=spot_broker_id, proxies=proxies)
         # Default to USDT-M futures
         # Binance Futures Testnet: https://testnet.binancefuture.com (official)
         default_url = "https://testnet.binancefuture.com" if is_demo else "https://fapi.binance.com"
         base_url = _get(exchange_config, "base_url", "baseUrl") or default_url
-        return BinanceFuturesClient(api_key=api_key, secret_key=secret_key, base_url=base_url, enable_demo_trading=is_demo, broker_id=futures_broker_id)
+        return BinanceFuturesClient(api_key=api_key, secret_key=secret_key, base_url=base_url, enable_demo_trading=is_demo, broker_id=futures_broker_id, proxies=proxies)
     if exchange_id == "okx":
         base_url = _get(exchange_config, "base_url", "baseUrl") or "https://www.okx.com"
         broker_code = "56fa80b0ce8cBCDE"

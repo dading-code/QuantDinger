@@ -22,7 +22,13 @@ def normalize_forex_pair_symbol(symbol: str) -> str:
     if not symbol:
         return symbol
     s = str(symbol).strip().upper().replace(" ", "").replace("-", "")
-    return s.replace("/", "")
+    s = s.replace("/", "")
+    # Strip Yahoo Finance suffix (e.g. EURUSD.c -> EURUSD, XAUUSD.C -> XAUUSD)
+    if s.endswith(".C"):
+        s = s[:-2]
+    elif s.endswith(".X"):
+        s = s[:-2]
+    return s
 
 
 # 全局缓存

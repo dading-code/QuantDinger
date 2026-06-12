@@ -19,12 +19,12 @@ from app.services.live_trading.symbols import to_binance_futures_symbol
 
 
 class BinanceSpotClient(BaseRestClient):
-    def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0, broker_id: str = ""):
+    def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0, broker_id: str = "", proxies: Optional[Dict[str, str]] = None):
         if not base_url:
             # Binance Spot Testnet (official): https://testnet.binance.vision
             base_url = "https://testnet.binance.vision" if enable_demo_trading else "https://api.binance.com"
 
-        super().__init__(base_url=base_url, timeout_sec=timeout_sec)
+        super().__init__(base_url=base_url, timeout_sec=timeout_sec, proxies=proxies)
         self.api_key = (api_key or "").strip()
         self.secret_key = (secret_key or "").strip()
         self.broker_id = (broker_id or "").strip()
