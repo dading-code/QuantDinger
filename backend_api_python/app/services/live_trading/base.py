@@ -93,9 +93,10 @@ class LiveTradingError(Exception):
 
 
 class BaseRestClient:
-    def __init__(self, base_url: str, timeout_sec: float = 15.0):
+    def __init__(self, base_url: str, timeout_sec: float = 15.0, proxies: Optional[Dict[str, str]] = None):
         self.base_url = (base_url or "").rstrip("/")
         self.timeout_sec = float(timeout_sec)
+        self.proxies = proxies
 
     def _url(self, path: str) -> str:
         p = str(path or "")
@@ -124,6 +125,7 @@ class BaseRestClient:
                 headers=headers or None,
                 timeout=self.timeout_sec,
                 verify=_get_requests_verify(),
+                proxies=self.proxies,
             )
         except UnicodeEncodeError as e:
             # requests/http.client requires header values to be latin-1 encodable.

@@ -76,6 +76,7 @@ class MarketDataCollector:
         timeframe: str = "1D",
         include_macro: bool = True,
         include_news: bool = True,
+        include_polymarket: bool = True,
         timeout: int = 30
     ) -> Dict[str, Any]:
         """
@@ -87,6 +88,7 @@ class MarketDataCollector:
             timeframe: K线周期
             include_macro: 是否包含宏观数据
             include_news: 是否包含新闻
+            include_polymarket: 是否包含预测市场数据
             timeout: 总超时时间(秒)
             
         Returns:
@@ -112,6 +114,8 @@ class MarketDataCollector:
             # 情绪
             "news": [],
             "sentiment": {},
+            # 预测市场
+            "polymarket": [],
             # 元数据
             "_meta": {
                 "success_items": [],
@@ -199,6 +203,17 @@ class MarketDataCollector:
             except Exception as e:
                 logger.warning(f"News fetch failed: {e}")
                 data["_meta"]["failed_items"].append("news")
+        
+        # === 阶段4: 预测市场数据 (如果需要) ===
+        if include_polymarket:
+            try:
+                pm_data = self._get_polymarket(market, symbol, timeout=8)
+                if pm_data:
+                    data["polymarket"] = pm_data
+                    data["_meta"]["success_items"].append("polymarket")
+            except Exception as e:
+                logger.warning(f"Polymarket data fetch failed: {e}")
+                data["_meta"]["failed_items"].append("polymarket")
         
         # 记录总耗时
         data["_meta"]["duration_ms"] = int((time.time() - start_time) * 1000)
@@ -2068,6 +2083,14 @@ class MarketDataCollector:
             logger.debug(f"Failed to get global major events: {e}")
             return []
     
+    def _get_polymarket(self, market: str, symbol: str, timeout: int = 8) -> List[Dict]:
+        """获取预测市场数据（Polymarket 相关事件）。
+        
+        TODO: 后续对接真实 Polymarket API。
+        当前返回空列表，fast_analysis 中会显示 "No related prediction market events found."
+        """
+        return []
+
 # 全局实例
 _collector: Optional[MarketDataCollector] = None
 

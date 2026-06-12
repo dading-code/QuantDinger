@@ -5,6 +5,7 @@ Kept separate from AnalysisService to avoid circular imports.
 """
 import json
 import os
+import re
 import requests
 from typing import Dict, Any, Optional, List
 from enum import Enum
@@ -263,6 +264,120 @@ class LLMService:
         else:
             raise ValueError("API response is missing 'choices'")
 
+    def _call_anythingllm(self, messages: list, model: str, temperature: float,
+                          api_key: str, base_url: str, timeout: int) -> str:
+        """
+        Call AnythingLLM API.
+        AnythingLLM has a different request/response format from OpenAI.
+        
+        Expected base_url:
+        - Full URL: http://host:port/api/v1/workspace/{slug}/chat
+        - Or base URL: http://host:port (will append /api/v1/workspace/{workspace}/chat)
+        """
+        from app.config import APIKeys
+
+        logger.info(f"[_call_anythingllm] base_url input: {base_url}")
+
+        workspace = APIKeys.ANYTHINGLLM_WORKSPACE or os.getenv("ANYTHINGLLM_WORKSPACE", "").strip()
+        logger.info(f"[_call_anythingllm] workspace: {workspace}")
+
+        if "/api/v1/workspace/" in base_url and base_url.endswith("/chat"):
+            url = base_url
+        elif "/api/v1/workspace/" in base_url and not base_url.endswith("/chat"):
+            url = f"{base_url.rstrip('/')}/chat"
+        else:
+            if not workspace:
+                raise ValueError("ANYTHINGLLM_WORKSPACE not configured. Please set it in .env or settings.")
+            url = f"{base_url.rstrip('/')}/api/v1/workspace/{workspace}/chat"
+
+        logger.info(f"[_call_anythingllm] final URL: {url}")
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if (api_key or "").strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+            logger.info(f"[_call_anythingllm] Using API key: {api_key.strip()[:10]}...")
+
+        user_message = ""
+        system_prompt = ""
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                system_prompt = content
+            elif role == "user":
+                if user_message:
+                    user_message += "\n\n"
+                user_message += content
+
+        if system_prompt:
+            user_message = f"{system_prompt}\n\n{user_message}"
+
+        data = {
+            "message": user_message,
+            "mode": "chat",
+        }
+        # If ANYTHINGLLM_MAX_TOKENS is configured, pass it to limit/prevent truncation
+        max_tokens = os.getenv("ANYTHINGLLM_MAX_TOKENS", "").strip()
+        if max_tokens:
+            try:
+                data["max_tokens"] = int(max_tokens)
+            except ValueError:
+                pass
+        
+        logger.info(f"[_call_anythingllm] Sending request to {url}")
+        logger.info(f"[_call_anythingllm] Message length: {len(user_message)} chars")
+
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=timeout)
+        except requests.exceptions.Timeout:
+            logger.error(f"[_call_anythingllm] Timeout after {timeout}s")
+            raise
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"[_call_anythingllm] Connection error: {e}")
+            raise
+
+        logger.info(f"[_call_anythingllm] Response status: {response.status_code}")
+
+        if response.status_code >= 400:
+            err_text = (response.text or "").strip()[:300]
+            logger.error(f"[_call_anythingllm] Error {response.status_code}: {err_text}")
+            raise ValueError(f"AnythingLLM API {response.status_code}: {err_text}")
+
+        try:
+            result = response.json()
+        except ValueError:
+            logger.error(f"[_call_anythingllm] Invalid JSON response: {response.text[:200]}")
+            raise ValueError("AnythingLLM API returned invalid JSON")
+
+        logger.info(f"[_call_anythingllm] Response keys: {list(result.keys())}")
+
+        content = None
+        if "textResponse" in result:
+            content = result.get("textResponse")
+        elif "response" in result:
+            content = result.get("response")
+        elif "choices" in result and len(result["choices"]) > 0:
+            choice = result["choices"][0]
+            if "message" in choice:
+                content = choice["message"].get("content")
+            elif "delta" in choice:
+                content = choice["delta"].get("content")
+
+        if not content:
+            logger.warning(f"AnythingLLM raw response: {json.dumps(result, default=str, ensure_ascii=False)[:500]}")
+            raise ValueError("AnythingLLM response is missing textResponse/response/choices")
+
+        content = str(content).strip()
+        # Strip <think> tags AND THEIR CONTENT commonly added by certain models (e.g. openai/gpt-oss-120b)
+        # These tags wrap reasoning and break JSON parsing in the caller.
+        # Match <think>...</think> across multiple lines and remove it entirely
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.IGNORECASE | re.DOTALL).strip()
+        logger.info(f"[_call_anythingllm] Success! Content length: {len(content)} chars (after stripping think block)")
+        return content
+
     def _call_google_gemini(self, messages: list, model: str, temperature: float,
                            api_key: str, base_url: str, timeout: int) -> str:
         """Call Google Gemini API."""
@@ -486,8 +601,12 @@ class LLMService:
                         messages, current_model, temperature,
                         api_key, base_url, timeout
                     )
+                elif p == LLMProvider.ANYTHINGLLM:
+                    return self._call_anythingllm(
+                        messages, current_model, temperature,
+                        api_key, base_url, timeout
+                    )
                 else:
-                    # OpenAI-compatible providers
                     return self._call_openai_compatible(
                         messages, current_model, temperature,
                         api_key, base_url, timeout,
@@ -602,6 +721,9 @@ class LLMService:
                     clean_text = clean_text[first_newline+1:]
                 if clean_text.endswith("```"):
                     clean_text = clean_text[:-3]
+            # Strip <think> tags AND THEIR CONTENT commonly added by certain models
+            # These tags wrap reasoning and break JSON parsing.
+            clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.IGNORECASE | re.DOTALL).strip()
             clean_text = clean_text.strip()
             
             # Parse JSON
@@ -613,11 +735,70 @@ class LLMService:
             # Try extracting JSON substring
             try:
                 if response_text:
-                    start = response_text.find('{')
-                    end = response_text.rfind('}') + 1
-                    if start >= 0 and end > start:
-                        result = json.loads(response_text[start:end])
+                    # Strip <think> tags AND THEIR CONTENT before extracting JSON
+                    text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.IGNORECASE | re.DOTALL)
+                    # Strategy 1: Find the LAST complete JSON object (most models put JSON at the end)
+                    last_open = text.rfind('{')
+                    last_close = text.rfind('}')
+                    if last_open >= 0 and last_close > last_open:
+                        candidate = text[last_open:last_close + 1]
+                        result = json.loads(candidate)
                         return result
+            except:
+                pass
+            try:
+                if response_text:
+                    # Strip <think> tags AND THEIR CONTENT before extracting JSON
+                    text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.IGNORECASE | re.DOTALL)
+                    # Strategy 2: Find the FIRST complete JSON object
+                    first_open = text.find('{')
+                    if first_open >= 0:
+                        depth = 0
+                        for i in range(first_open, len(text)):
+                            if text[i] == '{':
+                                depth += 1
+                            elif text[i] == '}':
+                                depth -= 1
+                                if depth == 0:
+                                    result = json.loads(text[first_open:i + 1])
+                                    return result
+            except:
+                pass
+            try:
+                if response_text:
+                    # Strategy 3: Try to repair truncated JSON (e.g. cut off mid-string)
+                    text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.IGNORECASE | re.DOTALL)
+                    first_open = text.find('{')
+                    if first_open >= 0:
+                        # Attempt to extract fields from partial JSON via regex
+                        partial = text[first_open:]
+                        result = default_structure.copy()
+                        # Extract decision (BUY/SELL/HOLD)
+                        m = re.search(r'"decision"\s*:\s*"(BUY|SELL|HOLD)"', partial, re.IGNORECASE)
+                        if m:
+                            result["decision"] = m.group(1).upper()
+                        # Extract confidence (numeric)
+                        m = re.search(r'"confidence"\s*:\s*(\d+)', partial)
+                        if m:
+                            result["confidence"] = int(m.group(1))
+                        # Extract summary (may be truncated, take what we can)
+                        m = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)', partial)
+                        if m:
+                            result["summary"] = m.group(1) + "..."
+                        # Extract scores if present
+                        m = re.search(r'"technical_score"\s*:\s*([\d.]+)', partial)
+                        if m:
+                            result["technical_score"] = float(m.group(1))
+                        m = re.search(r'"fundamental_score"\s*:\s*([\d.]+)', partial)
+                        if m:
+                            result["fundamental_score"] = float(m.group(1))
+                        m = re.search(r'"sentiment_score"\s*:\s*([\d.]+)', partial)
+                        if m:
+                            result["sentiment_score"] = float(m.group(1))
+                        # Clear the default error summary if we got real data
+                        if result["decision"] != default_structure.get("decision") or result["summary"] != default_structure.get("summary"):
+                            result.pop("report", None)
+                            return result
             except:
                 pass
             
